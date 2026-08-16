@@ -1,0 +1,17 @@
+# golangci-lint (v2 config schema) per docs/coding-standards.md §1.
+# gosec is enabled deliberately: this project handles secrets and
+# multi-tenant data, not because it's a default.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - gosec
+    - unused
+    - ineffassign
+
+run:
+  timeout: 5m
