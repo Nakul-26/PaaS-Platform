@@ -38,7 +38,7 @@ Per ADR-0012 — what each `services/` binary exposes, and therefore what any ot
 | `apiserver` | REST API (`/v1/...`) | `api-conventions.md` |
 | `scheduler` | NATS: consumes placement work items, publishes `node.<id>.assign` | *(proto/message schema — added when introduced in Phase 2)* |
 | `controller-manager` | No inbound contract (reads desired/actual state, acts); publishes reconciliation events to NATS | *(Phase 3)* |
-| `worker` | NATS: subscribes to its own assignment subject, publishes heartbeats/status/logs | *(Phase 2)* |
+| `worker` | HTTP: container lifecycle (start/stop/status/logs), called directly by `apiserver` (Phase 1 shape — single worker, no scheduler yet). Phase 2 adds NATS: subscribes to its own assignment subject, publishes heartbeats/status/logs, as an additive transport alongside the HTTP contract, not a replacement. | `worker-agent-contract.md` (HTTP); NATS subjects *(Phase 2)* |
 | `loadbalancer` | HTTP/WS on tenant-facing ports; reads service registry (Postgres + NATS `service.updated`) | `ARCHITECTURE.md` §2.5–2.6 |
 | `image-builder` | NATS or REST trigger (build requested), publishes build-complete events | *(Phase 7)* |
 

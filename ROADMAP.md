@@ -7,7 +7,7 @@ Status legend: ⬜ Not started · 🟨 In progress · ✅ Done
 | Phase | Name | Status | Notes |
 |---|---|:---:|---|
 | 0 | Architecture | ✅ | `ARCHITECTURE.md` + full `docs/` set written 2026-08-16. |
-| 1 | Single-Node Container Platform (MVP) | 🟨 | Started 2026-08-16. Tasks 1-3 done: repo/module scaffolding; Postgres migrations 0001-0004 with RLS (ADR-0010) + cross-tenant integration test; `ContainerRuntime` interface + Docker SDK adapter with lifecycle integration test. |
+| 1 | Single-Node Container Platform (MVP) | 🟨 | Started 2026-08-16. Tasks 1-4 done: repo/module scaffolding; Postgres migrations 0001-0004 with RLS (ADR-0010) + cross-tenant integration test; `ContainerRuntime` interface + Docker SDK adapter with lifecycle integration test; worker agent (separate process, HTTP contract in `docs/worker-agent-contract.md`) with lifecycle integration test driven purely over HTTP. |
 | 2 | Multi-Node Infrastructure | ⬜ | |
 | 3 | Desired State + Controllers | ⬜ | |
 | 4 | Service Discovery + Load Balancer | ⬜ | |
@@ -21,7 +21,7 @@ Status legend: ⬜ Not started · 🟨 In progress · ✅ Done
 
 ## Next action
 
-Task 4: worker agent (separate process, HTTP contract per ADR-0012, uses the `ContainerRuntime` interface from Task 3) — per `docs/phases/phase-1-mvp.md`.
+Task 5: API server core CRUD (auth, default-org bootstrap, per-aggregate repositories, `create project`/`create application`/`deploy`/`get deployments`/`delete application` routes calling the worker agent from Task 4 over its HTTP contract) — per `docs/phases/phase-1-mvp.md`.
 
 ## How to update this file
 

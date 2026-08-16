@@ -3,6 +3,7 @@ module platform
 go 1.26.5
 
 require (
+	github.com/containerd/errdefs v1.0.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/moby/moby/api v1.55.0
 	github.com/moby/moby/client v0.5.0
@@ -22,7 +23,6 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
-	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/platforms v0.2.1 // indirect
