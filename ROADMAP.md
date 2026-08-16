@@ -7,7 +7,7 @@ Status legend: ⬜ Not started · 🟨 In progress · ✅ Done
 | Phase | Name | Status | Notes |
 |---|---|:---:|---|
 | 0 | Architecture | ✅ | `ARCHITECTURE.md` + full `docs/` set written 2026-08-16. |
-| 1 | Single-Node Container Platform (MVP) | 🟨 | Started 2026-08-16. Task 1 (repo & module scaffolding) in progress: `go.mod`, repo layout, `.golangci.yml`, service/CLI stub binaries in place. |
+| 1 | Single-Node Container Platform (MVP) | 🟨 | Started 2026-08-16. Tasks 1-3 done: repo/module scaffolding; Postgres migrations 0001-0004 with RLS (ADR-0010) + cross-tenant integration test; `ContainerRuntime` interface + Docker SDK adapter with lifecycle integration test. |
 | 2 | Multi-Node Infrastructure | ⬜ | |
 | 3 | Desired State + Controllers | ⬜ | |
 | 4 | Service Discovery + Load Balancer | ⬜ | |
@@ -21,7 +21,7 @@ Status legend: ⬜ Not started · 🟨 In progress · ✅ Done
 
 ## Next action
 
-Finish Task 1 (repo & module scaffolding) — verify `golangci-lint` passes — then move to Task 2 (Postgres + migrations) and Task 3 (`ContainerRuntime` interface), which can run in parallel, per `docs/phases/phase-1-mvp.md`.
+Task 4: worker agent (separate process, HTTP contract per ADR-0012, uses the `ContainerRuntime` interface from Task 3) — per `docs/phases/phase-1-mvp.md`.
 
 ## How to update this file
 
