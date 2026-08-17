@@ -55,20 +55,37 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO pl
 ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memberships FORCE ROW LEVEL SECURITY;
 
+-- A self-referential subquery inside memberships' own policy (checking "is
+-- the requester an owner/admin of this row's org" by querying memberships
+-- again) makes Postgres reject the policy outright with "infinite
+-- recursion detected in policy for relation memberships" — every access to
+-- the table, including the subquery's own, re-triggers the same policy.
+-- The standard fix is to move that self-check into a SECURITY DEFINER
+-- function: owned by the migration's superuser role, so its internal query
+-- runs with RLS bypassed (superusers always bypass RLS, even FORCE ROW
+-- LEVEL SECURITY) instead of recursively re-evaluating this policy.
+-- +goose StatementBegin
+CREATE FUNCTION is_org_admin(check_org_id UUID) RETURNS boolean
+LANGUAGE sql SECURITY DEFINER STABLE AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM memberships
+        WHERE org_id = check_org_id
+          AND user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+          AND role IN ('owner', 'admin')
+    );
+$$;
+-- +goose StatementEnd
+
 -- Visible if it's the requester's own membership, or the requester is an
 -- owner/admin in the same org (needed for member-management UI, Phase 6).
 CREATE POLICY memberships_isolation ON memberships
     USING (
-        user_id = current_setting('app.current_user_id', true)::uuid
-        OR EXISTS (
-            SELECT 1 FROM memberships m2
-            WHERE m2.org_id = memberships.org_id
-              AND m2.user_id = current_setting('app.current_user_id', true)::uuid
-              AND m2.role IN ('owner', 'admin')
-        )
+        user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+        OR is_org_admin(org_id)
     );
 
 -- +goose Down
+DROP FUNCTION is_org_admin(UUID);
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM platform_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE USAGE, SELECT ON SEQUENCES FROM platform_app;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM platform_app;

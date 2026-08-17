@@ -17,8 +17,16 @@ CREATE TABLE applications (
 ALTER TABLE applications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE applications FORCE ROW LEVEL SECURITY;
 
+-- See the comment on api_keys_isolation (0002_api_keys.sql) for why this is
+-- an OR of two branches rather than a single org_id check.
 CREATE POLICY applications_isolation ON applications
-    USING (org_id = current_setting('app.current_org_id', true)::uuid);
+    USING (
+        org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid
+        OR org_id IN (
+            SELECT m.org_id FROM memberships m
+            WHERE m.user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+        )
+    );
 
 -- env_vars reaches its org only via applications.project_id → projects.org_id;
 -- org_id is denormalized here directly per database-schema.md §3 so its RLS
@@ -38,7 +46,13 @@ ALTER TABLE env_vars ENABLE ROW LEVEL SECURITY;
 ALTER TABLE env_vars FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY env_vars_isolation ON env_vars
-    USING (org_id = current_setting('app.current_org_id', true)::uuid);
+    USING (
+        org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid
+        OR org_id IN (
+            SELECT m.org_id FROM memberships m
+            WHERE m.user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+        )
+    );
 
 -- +goose Down
 DROP TABLE env_vars;

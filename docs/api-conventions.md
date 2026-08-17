@@ -16,6 +16,10 @@ https://api.<platform-domain>/v1/...
 Standard REST resource nouns, plural, nested under their parent where ownership is fixed:
 
 ```text
+POST   /v1/auth/signup
+POST   /v1/auth/login
+POST   /v1/auth/refresh
+
 GET    /v1/orgs/:orgId/projects
 POST   /v1/orgs/:orgId/projects
 GET    /v1/projects/:projectId/applications
@@ -34,6 +38,7 @@ Rule: once a resource has a global unique ID (everything here uses UUIDs), deep 
 
 ## 3. Auth
 
+- `POST /v1/auth/signup` and `POST /v1/auth/login` (ADR-0008) return a short-lived access token, a rotating refresh token, and the caller's default org (ADR-0004 — Phase 1 has no org-creation flow, so signup always bootstraps exactly one). `POST /v1/auth/refresh` trades a still-valid refresh token for a new access/refresh pair, revoking the one presented (rotation, not reuse).
 - `Authorization: Bearer <jwt>` for interactive (dashboard/CLI login) sessions.
 - `Authorization: Bearer <api_key>` for non-interactive callers — API server distinguishes by key format/prefix (e.g. `pk_live_...`) and looks up `api_keys.key_hash` accordingly (ADR-0008).
 - Every authenticated request resolves the caller's org membership + role server-side before touching any resource — never trust an `org_id` or role claim from client input.

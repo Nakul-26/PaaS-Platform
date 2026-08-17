@@ -80,8 +80,15 @@ Desired-state root for a deployable unit.
 
 ### `deployments`
 One row per deployment revision — this is the audit trail of "what was deployed when," not just current state.
-- `id pk`, `application_id fk`, `image`, `revision int`, `status enum(pending|scheduling|running|failed|rolled_back)`, `strategy enum(recreate|rolling)`, `created_by fk→users`, `created_at`, `completed_at nullable`
+- `id pk`, `org_id fk` (denormalized per §3), `application_id fk`, `image`, `revision int`, `status enum(pending|scheduling|running|failed|rolled_back)`, `strategy enum(recreate|rolling)`, `worker_container_id nullable` (Phase 1 only — single worker called directly, no `nodes`/`containers` tables yet; superseded once Phase 2 introduces real scheduling), `created_by fk→users`, `created_at`, `completed_at nullable`
 - Index: `(application_id, revision desc)` — "latest deployment for this app" and "deployment history" are both hot.
+- RLS: scoped to `org_id`, same policy shape as §3 describes for `applications`.
+
+### `refresh_tokens`
+Rotating refresh tokens (ADR-0008) — not in the original ERD sketch above since it hangs off `users`, not the tenant tree.
+- `id pk`, `user_id fk→users`, `token_hash unique`, `created_at`, `expires_at`, `revoked_at nullable`, `replaced_by_id nullable fk→refresh_tokens` (points at the token this one was rotated into, so a reused old token is detectable per ADR-0008)
+- Index: `(user_id)`.
+- No RLS — same reasoning as `users`: a session belongs to a user, not to any one org they're a member of.
 
 ### `nodes`
 Worker node registry.
@@ -121,6 +128,7 @@ Append-only.
 
 - Tables that aren't directly `org_id`-scoped (`applications`, `deployments`, `containers`, `env_vars`, `service_instances`) reach their org via a join chain. For RLS policies to stay simple and performant, **denormalize `org_id` onto every tenant-scoped table** (even ones that could derive it via join) rather than writing multi-hop RLS policies. This trades a small amount of storage/write complexity (must keep the denormalized column consistent, e.g. via a trigger or by always setting it explicitly at insert time) for RLS policies that are a single flat `org_id = current_setting('app.current_org_id')::uuid` check everywhere — much easier to audit for correctness than nested-subquery policies.
 - The application sets `app.current_org_id` as a transaction-local session variable at the start of every authenticated request's DB transaction, derived from the verified membership row — never from client-supplied input directly.
+- **Two-branch policies, as of migration 0005**: every tenant-scoped table's policy is actually `org_id = current_setting('app.current_org_id') OR org_id IN (SELECT org_id FROM memberships WHERE user_id = current_setting('app.current_user_id'))`. The second branch exists because `api-conventions.md` §2 deliberately addresses deep resources directly by ID (`/v1/projects/:projectId/applications`, no `orgId` in the URL) — the API server doesn't know the org_id yet at that point, only the caller's `user_id` from their verified access token, and needs to *resolve* org_id by querying the resource itself. Without the membership branch that resolution query would run RLS-blind (no `app.current_org_id` set yet) and return zero rows even for a legitimate member. With it, the resolution query is itself correctly RLS-scoped — a project/application the caller isn't a member of returns zero rows (404, not-found — never leaking existence), and one they are a member of resolves normally. `app.current_user_id` is set on every authenticated request transaction alongside `app.current_org_id` (once the latter is known); requests that don't yet have a resolved `org_id` (the deep-by-ID routes, until the first lookup) rely on the membership branch alone.
 
 ## 4. Migration tooling and ordering
 
@@ -132,11 +140,12 @@ Per `ARCHITECTURE.md` §11 open question 1: **goose**, SQL-file based, numbered 
 0003_projects.sql
 0004_applications_env_vars.sql
 0005_deployments.sql
-0006_nodes_containers.sql
-0007_services_service_instances.sql
-0008_domains.sql
-0009_resource_quotas.sql
-0010_audit_logs.sql
-0011_resource_usage_samples.sql
-0012_rls_policies.sql   -- or inline per-table above; decide at implementation time
+0006_refresh_tokens.sql
+0007_nodes_containers.sql
+0008_services_service_instances.sql
+0009_domains.sql
+0010_resource_quotas.sql
+0011_audit_logs.sql
+0012_resource_usage_samples.sql
+0013_rls_policies.sql   -- or inline per-table above; decide at implementation time
 ```

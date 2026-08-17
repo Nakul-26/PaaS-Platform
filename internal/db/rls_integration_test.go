@@ -24,7 +24,7 @@ func TestRLS_CrossTenantIsolation(t *testing.T) {
 	defer cancel()
 
 	const (
-		dbName   = "platform"
+		dbName    = "platform"
 		adminUser = "platform"
 		adminPass = "platform"
 	)
