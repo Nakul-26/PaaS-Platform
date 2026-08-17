@@ -7,7 +7,7 @@ Status legend: ⬜ Not started · 🟨 In progress · ✅ Done
 | Phase | Name | Status | Notes |
 |---|---|:---:|---|
 | 0 | Architecture | ✅ | `ARCHITECTURE.md` + full `docs/` set written 2026-08-16. |
-| 1 | Single-Node Container Platform (MVP) | 🟨 | Started 2026-08-16. Tasks 1-5 done: repo/module scaffolding; Postgres migrations 0001-0006 with RLS (ADR-0010) + cross-tenant integration test; `ContainerRuntime` interface + Docker SDK adapter with lifecycle integration test; worker agent (separate process, HTTP contract in `docs/worker-agent-contract.md`) with lifecycle integration test driven purely over HTTP; API server core CRUD (JWT auth + rotating refresh tokens, default-org bootstrap, per-aggregate repositories, RBAC middleware, project/application/deployment routes driving the worker agent) with a full-flow integration test against real Postgres + a real worker process. |
+| 1 | Single-Node Container Platform (MVP) | 🟨 | Started 2026-08-16. Tasks 1-6 done: repo/module scaffolding; Postgres migrations 0001-0006 with RLS (ADR-0010) + cross-tenant integration test; `ContainerRuntime` interface + Docker SDK adapter with lifecycle integration test; worker agent (separate process, HTTP contract in `docs/worker-agent-contract.md`) with lifecycle integration test driven purely over HTTP; API server core CRUD (JWT auth + rotating refresh tokens, default-org bootstrap, per-aggregate repositories, RBAC middleware, project/application/deployment routes driving the worker agent) with a full-flow integration test against real Postgres + a real worker process; `cobra`-based CLI (`apps/cli`, ADR-0007) — `signup`/`login`, `create project`, `deploy` (create-or-update + `--port` binding), `get deployments`, `logs`, `delete` — manually verified end-to-end against a real Postgres + worker + apiserver stack, including a real `nginx` container reachable via its mapped port. `logs` is wired to the not-yet-built `GET /v1/applications/:appId/logs` route (Task 7) and fails cleanly (404) until then. |
 | 2 | Multi-Node Infrastructure | ⬜ | |
 | 3 | Desired State + Controllers | ⬜ | |
 | 4 | Service Discovery + Load Balancer | ⬜ | |
@@ -21,7 +21,7 @@ Status legend: ⬜ Not started · 🟨 In progress · ✅ Done
 
 ## Next action
 
-Task 6: CLI (`cobra`-based thin REST client per ADR-0007 — `login`, `create project`, `deploy`, `get deployments`, `logs`, `delete`, no logic duplicated from the API server) — per `docs/phases/phase-1-mvp.md`.
+Task 7: Log retrieval (`GET /v1/applications/:appId/logs` proxied through the API server to the worker's `StreamLogs`, per `docs/worker-agent-contract.md`) — per `docs/phases/phase-1-mvp.md`. This is what makes the CLI's already-built `platform logs` command actually work.
 
 ## How to update this file
 
