@@ -30,6 +30,13 @@ type TokenStore interface {
 	Save() error
 }
 
+// requestTimeout bounds non-streaming calls only — it's applied per-call via
+// context, not as the http.Client's blanket Timeout, because that Timeout
+// covers the entire response body read and would silently cut off a
+// `platform logs --follow` stream after 30s (net/http docs: Client.Timeout
+// "includes ... reading the response body").
+const requestTimeout = 30 * time.Second
+
 type Client struct {
 	baseURL string
 	http    *http.Client
@@ -39,7 +46,7 @@ type Client struct {
 func New(baseURL string, tokens TokenStore) *Client {
 	return &Client{
 		baseURL: baseURL,
-		http:    &http.Client{Timeout: 30 * time.Second},
+		http:    &http.Client{},
 		tokens:  tokens,
 	}
 }
@@ -244,6 +251,9 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, out a
 }
 
 func (c *Client) raw(ctx context.Context, method, path string, body []byte, authenticate bool, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
 	var reqBody io.Reader = http.NoBody
 	if body != nil {
 		reqBody = bytes.NewReader(body)

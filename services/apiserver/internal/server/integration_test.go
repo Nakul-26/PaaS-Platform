@@ -52,7 +52,14 @@ func TestAPIServer_CoreCRUDFlow(t *testing.T) {
 	worker := workerclient.New(workerAddr)
 	srv := New(pool, issuer, worker, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ts := httptest.NewServer(srv.Routes())
-	defer ts.Close()
+	// Registered via t.Cleanup (not a plain defer) so it runs before the
+	// app-deletion safety-net cleanup below only if registered first —
+	// t.Cleanup runs LIFO, and that cleanup is registered after this one,
+	// so it fires while ts is still serving. A plain `defer ts.Close()`
+	// would run during this function's own return/Goexit unwind, i.e.
+	// before any t.Cleanup callback, closing ts out from under the
+	// delete-on-failure cleanup and silently no-oping it.
+	t.Cleanup(ts.Close)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 
@@ -115,6 +122,46 @@ func TestAPIServer_CoreCRUDFlow(t *testing.T) {
 	if len(data) != 1 {
 		t.Fatalf("expected exactly 1 deployment listed, got %d (%+v)", len(data), listResp)
 	}
+
+	// --- org A: logs (Task 7) — proxied through to the real worker/container.
+	// nginx's entrypoint flushes its startup log lines to the container's log
+	// driver very shortly after start, but not necessarily within the instant
+	// deploy's own ContainerStatus call observed it as "running" — so poll
+	// briefly rather than asserting non-empty on the first read.
+	var logsBody []byte
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		logsReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/applications/"+appID+"/logs", nil)
+		logsReq.Header.Set("Authorization", "Bearer "+tokenA)
+		logsResp, err := client.Do(logsReq)
+		if err != nil {
+			t.Fatalf("GET .../logs: %v", err)
+		}
+		body, err := io.ReadAll(logsResp.Body)
+		_ = logsResp.Body.Close()
+		if err != nil {
+			t.Fatalf("reading logs response body: %v", err)
+		}
+		if logsResp.StatusCode != http.StatusOK {
+			t.Fatalf("GET .../logs: status = %d, want 200 (body=%s)", logsResp.StatusCode, body)
+		}
+		if ct := logsResp.Header.Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+			t.Fatalf("GET .../logs: Content-Type = %q, want text/plain", ct)
+		}
+		logsBody = body
+		if len(logsBody) > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if len(logsBody) == 0 {
+		t.Fatalf("GET .../logs: expected nginx's startup log lines within 10s, got an empty body")
+	}
+
+	// org B must not be able to read org A's logs, same as every other
+	// application-scoped route (rbac-multitenancy.md §5).
+	assertStatus(t, ctx, client, http.MethodGet, ts.URL+"/v1/applications/"+appID+"/logs", tokenB,
+		nil, http.StatusNotFound)
 
 	// --- org A: delete application, confirm it and its deployments are gone ---
 	assertStatus(t, ctx, client, http.MethodDelete, ts.URL+"/v1/applications/"+appID, tokenA, nil, http.StatusNoContent)

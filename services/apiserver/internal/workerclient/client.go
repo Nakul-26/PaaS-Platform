@@ -23,6 +23,13 @@ import (
 // container the worker already reaped.
 var ErrNotFound = errors.New("workerclient: container not found")
 
+// requestTimeout bounds non-streaming calls only — it's applied per-call via
+// context, not as the http.Client's blanket Timeout, because that Timeout
+// covers the entire response body read and would silently cut off a
+// follow=true log stream after 30s (net/http docs: Client.Timeout "includes
+// ... reading the response body").
+const requestTimeout = 30 * time.Second
+
 type Client struct {
 	baseURL string
 	http    *http.Client
@@ -31,7 +38,7 @@ type Client struct {
 func New(baseURL string) *Client {
 	return &Client{
 		baseURL: baseURL,
-		http:    &http.Client{Timeout: 30 * time.Second},
+		http:    &http.Client{},
 	}
 }
 
@@ -89,6 +96,41 @@ func (c *Client) RemoveContainer(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/containers/"+id, nil, http.StatusNoContent, nil)
 }
 
+// StreamLogs proxies GET /v1/containers/:id/logs (docs/worker-agent-contract.md)
+// — a raw text/plain passthrough, not JSON, so it can't go through do(). The
+// caller must Close the returned reader. Deliberately uses ctx as given, with
+// no added timeout: with follow=true the worker holds the connection open
+// indefinitely, and the caller (the API server's own request context) is
+// what should decide when to stop reading.
+func (c *Client) StreamLogs(ctx context.Context, id string, follow bool) (io.ReadCloser, error) {
+	path := "/v1/containers/" + id + "/logs"
+	if follow {
+		path += "?follow=true"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building worker request: %w", err)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("calling worker GET %s: %w", path, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer func() { _ = resp.Body.Close() }()
+		var envelope workerErrorEnvelope
+		_ = json.NewDecoder(resp.Body).Decode(&envelope)
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, ErrNotFound
+		}
+		if envelope.Error.Message != "" {
+			return nil, fmt.Errorf("worker GET %s: %s (%s)", path, envelope.Error.Message, envelope.Error.Code)
+		}
+		return nil, fmt.Errorf("worker GET %s: unexpected status %d", path, resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
 type workerErrorEnvelope struct {
 	Error struct {
 		Code    string `json:"code"`
@@ -97,6 +139,9 @@ type workerErrorEnvelope struct {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body *bytes.Reader, wantStatus int, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
 	var reqBody io.Reader = http.NoBody
 	if body != nil {
 		reqBody = body
