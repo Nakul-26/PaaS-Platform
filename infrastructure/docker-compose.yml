@@ -15,5 +15,16 @@ services:
       timeout: 5s
       retries: 10
 
+  nats:
+    image: nats:2.11.7
+    command: ["-js"]
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+      - "${NATS_MONITOR_PORT:-8222}:8222"
+    # No exec-based healthcheck: the image ships only the nats-server binary
+    # (no shell, no wget/nc), so there's nothing to run one with. Consumers
+    # wait on the client port being reachable instead (as the eventbus
+    # integration test does via testcontainers' wait.ForListeningPort).
+
 volumes:
   postgres-data:
