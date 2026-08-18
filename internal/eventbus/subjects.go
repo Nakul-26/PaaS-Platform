@@ -22,6 +22,11 @@ func NodeStatusSubject(nodeID string) string {
 	return fmt.Sprintf("node.%s.status", nodeID)
 }
 
+// PlacementRequestedSubject is the fixed (non-per-node) subject the API
+// server publishes to when a deployment needs scheduling
+// (docs/nats-contract.md).
+const PlacementRequestedSubject = "placement.requested"
+
 // Stream names and wildcard subject filters for the JetStream-backed
 // subjects (docs/nats-contract.md's transport table) — assignments and
 // status transitions are loss-unacceptable, unlike register/heartbeat above.
@@ -31,4 +36,7 @@ const (
 
 	NodeStatusStream       = "NODE_STATUS"
 	NodeStatusStreamFilter = "node.*.status"
+
+	PlacementStream       = "PLACEMENT"
+	PlacementStreamFilter = "placement.requested"
 )
