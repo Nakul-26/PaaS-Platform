@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"platform/internal/eventbus"
+	"platform/internal/runtime"
 )
 
 // Config describes this worker's identity and capacity, as published on
@@ -29,18 +30,19 @@ type Config struct {
 	HeartbeatInterval     time.Duration
 }
 
-// Agent owns the register-then-heartbeat loop for one worker process.
+// Agent owns the register/heartbeat/assign loop for one worker process.
 type Agent struct {
 	bus    eventbus.EventBus
+	rt     runtime.ContainerRuntime
 	cfg    Config
 	logger *slog.Logger
 }
 
-func New(bus eventbus.EventBus, cfg Config, logger *slog.Logger) *Agent {
+func New(bus eventbus.EventBus, rt runtime.ContainerRuntime, cfg Config, logger *slog.Logger) *Agent {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Agent{bus: bus, cfg: cfg, logger: logger}
+	return &Agent{bus: bus, rt: rt, cfg: cfg, logger: logger}
 }
 
 type registerMessage struct {
@@ -57,17 +59,26 @@ type heartbeatMessage struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// Run publishes this worker's registration once, then heartbeats on
-// cfg.HeartbeatInterval until ctx is done. Publish failures are logged, not
-// fatal: both subjects are core NATS (docs/nats-contract.md's transport
-// table) precisely because a lost message here is self-healing — the next
-// heartbeat re-establishes the node.
+// Run publishes this worker's registration once, subscribes to its own
+// node.<id>.assign subject, then heartbeats on cfg.HeartbeatInterval until
+// ctx is done. Register/heartbeat publish failures are logged, not fatal:
+// both subjects are core NATS (docs/nats-contract.md's transport table)
+// precisely because a lost message here is self-healing — the next
+// heartbeat re-establishes the node. Failing to set up the assign
+// subscription, by contrast, is fatal to Run: without it this worker can
+// never receive placements, which is Task 4's entire point.
 func (a *Agent) Run(ctx context.Context) error {
 	if err := a.publishRegister(ctx); err != nil {
 		a.logger.Error("publishing node registration", "node_id", a.cfg.NodeID, "error", err)
 	} else {
 		a.logger.Info("node registered", "node_id", a.cfg.NodeID, "hostname", a.cfg.Hostname)
 	}
+
+	assignSub, err := a.subscribeAssignments(ctx)
+	if err != nil {
+		return fmt.Errorf("subscribing to assignments: %w", err)
+	}
+	defer func() { _ = assignSub.Unsubscribe() }()
 
 	ticker := time.NewTicker(a.cfg.HeartbeatInterval)
 	defer ticker.Stop()

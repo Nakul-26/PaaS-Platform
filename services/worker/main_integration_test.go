@@ -1,9 +1,12 @@
 //go:build integration
 
-// Package main's integration test covers Task 3's acceptance
+// Package main's integration tests cover Tasks 3-4's acceptance
 // (phase-2-multi-node.md): a real worker process, run as a separate OS
 // process against a real NATS instance, publishes a registration message on
-// startup and keeps publishing heartbeats on schedule.
+// startup and keeps publishing heartbeats on schedule (Task 3); and, given a
+// node.<id>.assign message published directly (no scheduler involved yet),
+// actually starts the container against a real Docker daemon and publishes a
+// node.<id>.status result (Task 4).
 package main
 
 import (
@@ -108,6 +111,156 @@ func TestWorker_RegistersAndHeartbeatsOverNATS(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("timed out waiting for heartbeats, only saw %d", seen)
 		}
+	}
+}
+
+// testAssignMessage mirrors nodeagent's own (unexported) assignMessage —
+// docs/nats-contract.md's node.<id>.assign schema — so this test can publish
+// one without importing the worker's internal package (ADR-0012: only the
+// published NATS contract, not the package tree).
+type testAssignMessage struct {
+	AssignmentID string            `json:"assignment_id"`
+	DeploymentID string            `json:"deployment_id"`
+	Image        string            `json:"image"`
+	Env          map[string]string `json:"env,omitempty"`
+	Ports        []testPortBinding `json:"ports,omitempty"`
+	Command      []string          `json:"command,omitempty"`
+}
+
+type testPortBinding struct {
+	ContainerPort int    `json:"container_port"`
+	HostPort      int    `json:"host_port,omitempty"`
+	Protocol      string `json:"protocol,omitempty"`
+}
+
+func TestWorker_ProcessesAssignmentOverNATS(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	rt, err := runtime.NewDockerRuntime()
+	if err != nil {
+		t.Skipf("docker daemon not available, skipping: %v", err)
+	}
+	defer func() { _ = rt.Close() }()
+
+	natsContainer, err := nats.Run(ctx, "nats:2.11.7")
+	if err != nil {
+		t.Fatalf("starting nats container: %v", err)
+	}
+	t.Cleanup(func() { _ = natsContainer.Terminate(context.Background()) })
+
+	natsURL, err := natsContainer.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("nats connection string: %v", err)
+	}
+
+	bus, err := eventbus.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connecting eventbus: %v", err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+
+	registrations := make(chan map[string]any, 4)
+	regSub, err := bus.Subscribe("node.*.register", func(msg eventbus.Message) {
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Data, &payload); err == nil {
+			registrations <- payload
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribing to node.*.register: %v", err)
+	}
+	defer func() { _ = regSub.Unsubscribe() }()
+
+	startTestWorker(t, ctx, natsURL)
+
+	var registration map[string]any
+	select {
+	case registration = <-registrations:
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for node registration message")
+	}
+	nodeID, _ := registration["node_id"].(string)
+	if nodeID == "" {
+		t.Fatalf("registration message missing node_id: %+v", registration)
+	}
+
+	// The worker sets up its own durable NODE_ASSIGNMENTS/NODE_STATUS
+	// streams on startup (subscribeAssignments); this test's EnsureStream
+	// calls are idempotent no-ops layered on top, exercising the same path
+	// the scheduler (Task 5) will use to publish for real.
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.NodeAssignmentsStream,
+		Subjects: []string{eventbus.NodeAssignmentsStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.NodeAssignmentsStream, err)
+	}
+	// The worker also calls EnsureStream for NODE_STATUS on startup
+	// (subscribeAssignments, before it publishes any status), but this
+	// test's own status subscription can race ahead of that — EnsureStream
+	// is idempotent, so calling it here too just closes the race.
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.NodeStatusStream,
+		Subjects: []string{eventbus.NodeStatusStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.NodeStatusStream, err)
+	}
+
+	statuses := make(chan map[string]any, 4)
+	statusSub, err := bus.SubscribeDurable(ctx, eventbus.NodeStatusStream, "test-status-watcher", eventbus.NodeStatusStreamFilter, func(msg eventbus.Message) error {
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Data, &payload); err == nil {
+			statuses <- payload
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribing to %s: %v", eventbus.NodeStatusStreamFilter, err)
+	}
+	defer func() { _ = statusSub.Unsubscribe() }()
+
+	const assignmentID = "test-assignment-1"
+	assignData, err := json.Marshal(testAssignMessage{
+		AssignmentID: assignmentID,
+		DeploymentID: "test-deployment-1",
+		Image:        "nginx:latest",
+		Ports:        []testPortBinding{{ContainerPort: 80}},
+	})
+	if err != nil {
+		t.Fatalf("marshaling assignment message: %v", err)
+	}
+	if err := bus.PublishDurable(ctx, fmt.Sprintf("node.%s.assign", nodeID), assignData); err != nil {
+		t.Fatalf("publishing assignment: %v", err)
+	}
+
+	var status map[string]any
+	select {
+	case status = <-statuses:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for node.<id>.status message")
+	}
+
+	if status["assignment_id"] != assignmentID {
+		t.Fatalf("expected assignment_id %s, got %+v", assignmentID, status)
+	}
+	if status["status"] != "running" {
+		t.Fatalf("expected status \"running\", got %+v", status)
+	}
+	containerID, _ := status["container_id"].(string)
+	if containerID == "" {
+		t.Fatalf("status message missing container_id: %+v", status)
+	}
+	t.Cleanup(func() {
+		_ = rt.StopContainer(context.Background(), containerID, 5*time.Second)
+		_ = rt.RemoveContainer(context.Background(), containerID)
+	})
+
+	info, err := rt.ContainerStatus(ctx, containerID)
+	if err != nil {
+		t.Fatalf("inspecting container %s on the real docker daemon: %v", containerID, err)
+	}
+	if info.Status != runtime.StatusRunning {
+		t.Fatalf("expected container %s to actually be running on the docker daemon, got status %q", containerID, info.Status)
 	}
 }
 

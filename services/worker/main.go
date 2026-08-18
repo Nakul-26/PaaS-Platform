@@ -54,7 +54,7 @@ func main() {
 	bus := connectEventBus(ctx, logger)
 	if bus != nil {
 		defer func() { _ = bus.Close() }()
-		go runNodeAgent(ctx, bus, logger)
+		go runNodeAgent(ctx, bus, rt, logger)
 	}
 
 	<-ctx.Done()
@@ -94,9 +94,9 @@ func connectEventBus(ctx context.Context, logger *slog.Logger) eventbus.EventBus
 	}
 }
 
-// runNodeAgent runs the node.<id>.register/heartbeat loop (phase-2-multi-node.md
-// Task 3) until ctx is done.
-func runNodeAgent(ctx context.Context, bus eventbus.EventBus, logger *slog.Logger) {
+// runNodeAgent runs the node.<id>.register/heartbeat/assign loop
+// (phase-2-multi-node.md Tasks 3-4) until ctx is done.
+func runNodeAgent(ctx context.Context, bus eventbus.EventBus, rt runtime.ContainerRuntime, logger *slog.Logger) {
 	nodeIDFile := config.String("WORKER_NODE_ID_FILE", "worker-node-id")
 	nodeID, err := nodeagent.LoadOrCreateNodeID(nodeIDFile)
 	if err != nil {
@@ -116,7 +116,7 @@ func runNodeAgent(ctx context.Context, bus eventbus.EventBus, logger *slog.Logge
 		ip = outboundIP()
 	}
 
-	agent := nodeagent.New(bus, nodeagent.Config{
+	agent := nodeagent.New(bus, rt, nodeagent.Config{
 		NodeID:                nodeID,
 		Hostname:              hostname,
 		IP:                    ip,
