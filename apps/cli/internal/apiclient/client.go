@@ -198,6 +198,26 @@ func (c *Client) DeleteApplication(ctx context.Context, appID string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/applications/"+appID, nil, nil)
 }
 
+// Node mirrors handlers_nodes.go's nodeResponse (Task 7).
+type Node struct {
+	ID              string    `json:"id"`
+	Hostname        string    `json:"hostname"`
+	Status          string    `json:"status"`
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
+}
+
+type NodePage struct {
+	Data []Node `json:"data"`
+}
+
+// ListNodes calls GET /v1/nodes, gated server-side by requirePlatformAdmin —
+// no project or org scoping is needed here since nodes carry no RLS.
+func (c *Client) ListNodes(ctx context.Context) (NodePage, error) {
+	var page NodePage
+	err := c.do(ctx, http.MethodGet, "/v1/nodes", nil, &page)
+	return page, err
+}
+
 // StreamLogs proxies GET /v1/applications/:appId/logs (Task 7) and copies
 // the response body verbatim to w as it arrives — the CLI does no framing
 // of its own, it just surfaces whatever the server sends.

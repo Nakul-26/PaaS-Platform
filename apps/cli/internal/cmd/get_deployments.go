@@ -16,6 +16,7 @@ func newGetCmd() *cobra.Command {
 		Short: "Get a resource",
 	}
 	c.AddCommand(newGetDeploymentsCmd())
+	c.AddCommand(newGetNodesCmd())
 	return c
 }
 
