@@ -26,5 +26,68 @@ services:
     # wait on the client port being reachable instead (as the eventbus
     # integration test does via testcontainers' wait.ForListeningPort).
 
+  # worker-1/2/3: three logical worker nodes per ADR-0009 — separate
+  # processes, each with its own artificial capacity ceiling, all pointed at
+  # this one host's real Docker daemon via the mounted socket (not isolated
+  # hosts; see the ADR for what that does and doesn't prove). Only
+  # apiserver/scheduler talk to Postgres — the worker doesn't, so no
+  # depends_on: postgres here.
+  worker-1:
+    build:
+      context: ..
+      dockerfile: services/worker/Dockerfile
+    environment:
+      WORKER_HOSTNAME: worker-1
+      WORKER_NATS_URL: nats://nats:4222
+      WORKER_NODE_ID_FILE: /data/worker-node-id
+      WORKER_CPU_CAPACITY_MILLICORES: 2000
+      WORKER_MEMORY_CAPACITY_MB: 2048
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - worker-1-data:/data
+    ports:
+      - "${WORKER_1_PORT:-7101}:7100"
+    depends_on:
+      - nats
+
+  worker-2:
+    build:
+      context: ..
+      dockerfile: services/worker/Dockerfile
+    environment:
+      WORKER_HOSTNAME: worker-2
+      WORKER_NATS_URL: nats://nats:4222
+      WORKER_NODE_ID_FILE: /data/worker-node-id
+      WORKER_CPU_CAPACITY_MILLICORES: 1000
+      WORKER_MEMORY_CAPACITY_MB: 1024
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - worker-2-data:/data
+    ports:
+      - "${WORKER_2_PORT:-7102}:7100"
+    depends_on:
+      - nats
+
+  worker-3:
+    build:
+      context: ..
+      dockerfile: services/worker/Dockerfile
+    environment:
+      WORKER_HOSTNAME: worker-3
+      WORKER_NATS_URL: nats://nats:4222
+      WORKER_NODE_ID_FILE: /data/worker-node-id
+      WORKER_CPU_CAPACITY_MILLICORES: 3000
+      WORKER_MEMORY_CAPACITY_MB: 3072
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - worker-3-data:/data
+    ports:
+      - "${WORKER_3_PORT:-7103}:7100"
+    depends_on:
+      - nats
+
 volumes:
   postgres-data:
+  worker-1-data:
+  worker-2-data:
+  worker-3-data:
