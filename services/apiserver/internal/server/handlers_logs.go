@@ -18,6 +18,12 @@ import (
 // (phase-1-mvp.md Task 7) — reads directly from the worker agent's
 // StreamLogs, proxied through here; not fanned out via NATS, that's Phase
 // 4+ once there are multiple consumers of log data.
+//
+// s.worker is still the one hardcoded worker address from Phase 1
+// (WORKER_ADDR) — this only resolves correctly while there's a single
+// worker node, which is still true today (phase-2-multi-node.md Task 8, not
+// yet done, is what brings up multiple). Routing this to whichever node
+// actually holds the container is deferred, not this task's job.
 func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 	userID, _ := auth.UserIDFromContext(r.Context())
 	appID, err := uuid.Parse(r.PathValue("appId"))
@@ -46,10 +52,19 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return mapDBError(err, "this application has never been deployed", "")
 		}
-		if deployment.WorkerContainerID == nil {
+
+		// deployment.WorkerContainerID is a Phase 1 relic that Task 6's
+		// event-driven deploy path no longer populates — the containers
+		// table (written by the scheduler once it places the deployment) is
+		// now the source of truth for which container backs it.
+		containers, err := db.NewContainerRepository(conn).ListByDeployment(ctx, deployment.ID)
+		if err != nil {
+			return err
+		}
+		if len(containers) == 0 || containers[0].ContainerRuntimeID == nil {
 			return errNotFound("this application's latest deployment has no running container to read logs from")
 		}
-		containerID = *deployment.WorkerContainerID
+		containerID = *containers[0].ContainerRuntimeID
 		return nil
 	})
 	if err != nil {

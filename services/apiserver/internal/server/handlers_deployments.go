@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -13,17 +14,24 @@ import (
 
 	"platform/internal/auth"
 	"platform/internal/db"
-	"platform/services/apiserver/internal/workerclient"
+	"platform/internal/eventbus"
 )
 
 type deploymentResponse struct {
-	ID                string     `json:"id"`
-	ApplicationID     string     `json:"application_id"`
-	Image             string     `json:"image"`
-	Revision          int        `json:"revision"`
-	Status            string     `json:"status"`
-	Strategy          string     `json:"strategy"`
+	ID            string `json:"id"`
+	ApplicationID string `json:"application_id"`
+	Image         string `json:"image"`
+	Revision      int    `json:"revision"`
+	Status        string `json:"status"`
+	Strategy      string `json:"strategy"`
+	// WorkerContainerID is a Phase 1 relic — handleDeploy no longer calls
+	// the worker synchronously (Task 6: event-driven placement), so this is
+	// always nil going forward. NodeID/ContainerStatus (populated via a join
+	// through containers) are its Task 6 replacement — see
+	// attachPlacement.
 	WorkerContainerID *string    `json:"worker_container_id,omitempty"`
+	NodeID            *string    `json:"node_id,omitempty"`
+	ContainerStatus   *string    `json:"container_status,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
 	CompletedAt       *time.Time `json:"completed_at,omitempty"`
 }
@@ -36,14 +44,36 @@ func toDeploymentResponse(d db.Deployment) deploymentResponse {
 	}
 }
 
+// attachPlacement fills in resp's NodeID/ContainerStatus from the most
+// recent containers row for deploymentID, if the scheduler has placed one
+// yet (phase-2-multi-node.md Task 6: "surface which node a deployment
+// landed on, via a join through containers").
+func attachPlacement(ctx context.Context, containers db.ContainerRepository, deploymentID uuid.UUID, resp *deploymentResponse) error {
+	rows, err := containers.ListByDeployment(ctx, deploymentID)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	nodeID := rows[0].NodeID.String()
+	status := string(rows[0].Status)
+	resp.NodeID = &nodeID
+	resp.ContainerStatus = &status
+	return nil
+}
+
 type deployRequest struct {
 	Image string `json:"image,omitempty"`
 }
 
-// handleDeploy is POST /v1/applications/:appId/deployments. Phase 1 has
-// exactly one worker, called directly over HTTP (phase-1-mvp.md Task 5) —
-// no scheduler yet, so "deploy" means "record a deployment row, then drive
-// the one worker to run it," recreate-only, single replica.
+// handleDeploy is POST /v1/applications/:appId/deployments. As of Task 6
+// (phase-2-multi-node.md), it no longer drives a worker directly: it writes
+// the deployments row (desired state, recreate-only, single replica) and
+// publishes placement.requested, matching ARCHITECTURE.md §2.1 ("the API
+// server does not talk to workers directly"). Actual placement is the
+// scheduler's job (Task 5); poll GET .../deployments to observe it land, via
+// attachPlacement's join through containers.
 func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	userID, _ := auth.UserIDFromContext(r.Context())
 	appID, err := uuid.Parse(r.PathValue("appId"))
@@ -102,56 +132,49 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Driving the worker is a network call outside any DB transaction
-	// (ADR-0012 — never held across a cross-service call). Its outcome is
-	// then recorded back onto the deployment row for the audit trail
-	// (database-schema.md's "what was deployed when").
-	ports := make([]workerclient.PortBinding, len(app.Ports))
+	// Publishing is a network call outside any DB transaction (ADR-0012 —
+	// never held across a cross-service call). A publish failure is a real,
+	// terminal failure of this deploy attempt (nothing will ever place it),
+	// so it's the one case that gets written back via UpdateResult; a
+	// successful publish leaves the row exactly as Create left it
+	// ('pending') — the scheduler and worker don't report back onto
+	// deployments at all, only onto containers (docs/nats-contract.md), so
+	// attachPlacement's join through containers is the actual source of
+	// live placement status from here on, not this row.
+	ports := make([]portBinding, len(app.Ports))
 	for i, p := range app.Ports {
-		ports[i] = workerclient.PortBinding{ContainerPort: p.ContainerPort, HostPort: p.HostPort, Protocol: p.Protocol}
+		ports[i] = portBinding{ContainerPort: p.ContainerPort, HostPort: p.HostPort, Protocol: p.Protocol}
 	}
-	containerName := fmt.Sprintf("app-%s-rev%d", appID.String()[:8], deployment.Revision)
-
-	status, workerErr := s.worker.CreateContainer(ctx, workerclient.CreateContainerRequest{
-		Image: deployment.Image,
-		Name:  containerName,
-		Ports: ports,
+	msgData, err := json.Marshal(placementRequestedMessage{
+		DeploymentID:  deployment.ID.String(),
+		ApplicationID: appID.String(),
+		Image:         deployment.Image,
+		Ports:         ports,
 	})
-
-	finalStatus := mapWorkerStatus(status.Status)
-	var containerID *string
-	if workerErr == nil {
-		containerID = &status.ID
-	} else {
-		s.logger.Error("driving worker for deployment", "deployment_id", deployment.ID, "error", workerErr)
-		finalStatus = db.DeploymentStatusFailed
-	}
-
-	updateErr := s.pool.WithTx(ctx, userID, orgID, func(ctx context.Context, conn db.Conn) error {
-		return db.NewDeploymentRepository(conn).UpdateResult(ctx, deployment.ID, finalStatus, containerID)
-	})
-	if updateErr != nil {
-		s.logger.Error("recording deployment result", "deployment_id", deployment.ID, "error", updateErr)
-	}
-
-	deployment.Status = finalStatus
-	deployment.WorkerContainerID = containerID
-	if workerErr != nil {
-		s.writeError(w, r, &apiError{http.StatusBadGateway, "deploy_failed", fmt.Sprintf("worker rejected the deployment: %v", workerErr)})
+	if err != nil {
+		s.logger.Error("marshaling placement.requested", "deployment_id", deployment.ID, "error", err)
+		s.writeError(w, r, fmt.Errorf("marshaling placement request: %w", err))
 		return
 	}
-	writeJSON(w, http.StatusCreated, toDeploymentResponse(deployment))
-}
 
-func mapWorkerStatus(workerStatus string) db.DeploymentStatus {
-	switch workerStatus {
-	case "running":
-		return db.DeploymentStatusRunning
-	case "exited":
-		return db.DeploymentStatusFailed
-	default:
-		return db.DeploymentStatusScheduling
+	var publishErr error
+	if s.bus == nil {
+		publishErr = errors.New("event bus not connected")
+	} else {
+		publishErr = s.bus.PublishDurable(ctx, eventbus.PlacementRequestedSubject, msgData)
 	}
+	if publishErr != nil {
+		s.logger.Error("publishing placement.requested", "deployment_id", deployment.ID, "error", publishErr)
+		if updateErr := s.pool.WithTx(ctx, userID, orgID, func(ctx context.Context, conn db.Conn) error {
+			return db.NewDeploymentRepository(conn).UpdateResult(ctx, deployment.ID, db.DeploymentStatusFailed, nil)
+		}); updateErr != nil {
+			s.logger.Error("recording deployment result", "deployment_id", deployment.ID, "error", updateErr)
+		}
+		s.writeError(w, r, &apiError{http.StatusBadGateway, "deploy_failed", fmt.Sprintf("failed to publish placement request: %v", publishErr)})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, toDeploymentResponse(deployment))
 }
 
 // handleGetDeployments is GET /v1/applications/:appId/deployments,
@@ -177,6 +200,7 @@ func (s *Server) handleGetDeployments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var deployments []db.Deployment
+	var data []deploymentResponse
 	err = s.pool.WithTx(r.Context(), userID, uuid.Nil, func(ctx context.Context, conn db.Conn) error {
 		orgID, err := db.NewApplicationRepository(conn).OrgID(ctx, appID)
 		if err != nil {
@@ -193,16 +217,23 @@ func (s *Server) handleGetDeployments(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		deployments, err = db.NewDeploymentRepository(conn).ListByApplication(ctx, appID, limit, afterRevision)
-		return err
+		if err != nil {
+			return err
+		}
+
+		containers := db.NewContainerRepository(conn)
+		data = make([]deploymentResponse, len(deployments))
+		for i, d := range deployments {
+			data[i] = toDeploymentResponse(d)
+			if err := attachPlacement(ctx, containers, d.ID, &data[i]); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		s.writeError(w, r, err)
 		return
-	}
-
-	data := make([]deploymentResponse, len(deployments))
-	for i, d := range deployments {
-		data[i] = toDeploymentResponse(d)
 	}
 	var nextCursor *string
 	if len(deployments) == limit {

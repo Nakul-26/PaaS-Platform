@@ -43,13 +43,17 @@ func newGetDeploymentsCmd() *cobra.Command {
 				return nil
 			}
 			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-			_, _ = fmt.Fprintln(tw, "REVISION\tSTATUS\tIMAGE\tCONTAINER\tCREATED_AT")
+			_, _ = fmt.Fprintln(tw, "REVISION\tSTATUS\tIMAGE\tNODE\tCONTAINER_STATUS\tCREATED_AT")
 			for _, d := range page.Data {
-				container := "-"
-				if d.WorkerContainerID != nil {
-					container = *d.WorkerContainerID
+				node := "-"
+				if d.NodeID != nil {
+					node = *d.NodeID
 				}
-				_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", d.Revision, d.Status, d.Image, container, d.CreatedAt.Format("2006-01-02T15:04:05Z"))
+				containerStatus := "-"
+				if d.ContainerStatus != nil {
+					containerStatus = *d.ContainerStatus
+				}
+				_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", d.Revision, d.Status, d.Image, node, containerStatus, d.CreatedAt.Format("2006-01-02T15:04:05Z"))
 			}
 			return tw.Flush()
 		},

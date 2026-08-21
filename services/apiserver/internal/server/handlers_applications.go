@@ -132,7 +132,17 @@ func (s *Server) handleDeleteApplication(w http.ResponseWriter, r *http.Request)
 			return err
 		}
 		if err == nil {
-			containerID = latest.WorkerContainerID
+			// latest.WorkerContainerID is a Phase 1 relic Task 6's
+			// event-driven deploy path no longer populates — the containers
+			// table (written by the scheduler once it places the
+			// deployment) is now the source of truth.
+			rows, err := db.NewContainerRepository(conn).ListByDeployment(ctx, latest.ID)
+			if err != nil {
+				return err
+			}
+			if len(rows) > 0 {
+				containerID = rows[0].ContainerRuntimeID
+			}
 		}
 		return nil
 	})

@@ -34,6 +34,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
+	"github.com/testcontainers/testcontainers-go/modules/nats"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
@@ -63,12 +64,27 @@ func TestE2E_Phase1ExitCriteria(t *testing.T) {
 	binDir := t.TempDir()
 
 	dbURL := startPostgres(t, ctx)
+	natsURL := startNATS(t, ctx)
+	// phase-2-multi-node.md Task 6 changed deploy from a synchronous HTTP
+	// call to the worker into an event-driven placement.requested publish —
+	// "the one behavior change to already-shipped Phase 1 code this phase
+	// requires" — so this Phase 1 script now also needs a real scheduler
+	// process to actually place the deployment. It's started before the
+	// worker deliberately: the worker's node registration is a one-shot
+	// core-NATS publish with no persistence, so if the scheduler's
+	// node.*.register subscription isn't live yet when the worker starts,
+	// that registration is lost forever and the node is never placeable.
+	startScheduler(t, ctx, goBin, binDir, dbURL, natsURL)
 	workerURL := startService(t, ctx, goBin, binDir, "worker", "platform/services/worker",
-		"WORKER_LISTEN_ADDR", nil, "/v1/containers/readiness-probe")
+		"WORKER_LISTEN_ADDR", []string{
+			"WORKER_NATS_URL=" + natsURL,
+			"WORKER_NODE_ID_FILE=" + filepath.Join(t.TempDir(), "worker-node-id"),
+		}, "/v1/containers/readiness-probe")
 	apiURL := startService(t, ctx, goBin, binDir, "apiserver", "platform/services/apiserver",
 		"APISERVER_LISTEN_ADDR", []string{
 			"APP_DATABASE_URL=" + dbURL,
 			"WORKER_ADDR=" + workerURL,
+			"APISERVER_NATS_URL=" + natsURL,
 			"JWT_SIGNING_KEY=e2e-test-signing-key",
 		}, "/")
 
@@ -170,6 +186,54 @@ func startPostgres(t *testing.T, ctx context.Context) string {
 		t.Fatalf("resolving container endpoint: %v", err)
 	}
 	return fmt.Sprintf("postgres://platform_app:platform_app@%s/platform?sslmode=disable", endpoint)
+}
+
+// startNATS starts a real NATS/JetStream testcontainer and returns its
+// connection URL, mirroring services/scheduler's and apiserver's own
+// integration tests.
+func startNATS(t *testing.T, ctx context.Context) string {
+	t.Helper()
+
+	container, err := nats.Run(ctx, "nats:2.11.7")
+	if err != nil {
+		t.Fatalf("starting nats container: %v", err)
+	}
+	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
+
+	url, err := container.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("nats connection string: %v", err)
+	}
+	return url
+}
+
+// startScheduler builds and runs the real scheduler binary as a separate OS
+// process. Unlike startService, it has no HTTP surface to poll for
+// readiness — the scheduler is entirely NATS/Postgres-driven — so this just
+// starts it and lets the deploy step further down give it time to catch up.
+func startScheduler(t *testing.T, ctx context.Context, goBin, binDir, dbURL, natsURL string) {
+	t.Helper()
+
+	binPath := filepath.Join(binDir, "scheduler"+exeSuffix())
+	buildBinary(t, ctx, goBin, binPath, "platform/services/scheduler")
+
+	// #nosec G204 -- binPath is a binary this same test just built into
+	// t.TempDir(), not external input.
+	cmd := exec.CommandContext(ctx, binPath)
+	cmd.Env = append(os.Environ(), "APP_DATABASE_URL="+dbURL, "SCHEDULER_NATS_URL="+natsURL)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting scheduler process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		if t.Failed() {
+			t.Logf("scheduler process output:\n%s", output.String())
+		}
+	})
 }
 
 // startService builds pkg into binDir and runs it as a real, separate OS

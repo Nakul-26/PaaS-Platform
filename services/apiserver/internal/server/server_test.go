@@ -19,23 +19,6 @@ func TestSlugify(t *testing.T) {
 	}
 }
 
-func TestMapWorkerStatus(t *testing.T) {
-	tests := []struct {
-		worker string
-		want   string
-	}{
-		{"running", "running"},
-		{"exited", "failed"},
-		{"pending", "scheduling"},
-		{"unknown", "scheduling"},
-	}
-	for _, tt := range tests {
-		if got := string(mapWorkerStatus(tt.worker)); got != tt.want {
-			t.Errorf("mapWorkerStatus(%q) = %q, want %q", tt.worker, got, tt.want)
-		}
-	}
-}
-
 func TestRevisionCursorRoundTrip(t *testing.T) {
 	cursor := encodeRevisionCursor(42)
 	got, err := decodeRevisionCursor(cursor)

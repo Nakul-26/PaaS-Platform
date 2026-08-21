@@ -42,6 +42,26 @@ func requireMembership(ctx context.Context, conn db.Conn, userID, orgID uuid.UUI
 	return auth.Role(role), nil
 }
 
+// requirePlatformAdmin gates GET /v1/nodes (phase-2-multi-node.md Task 6:
+// "gated behind the platform-level permission noted in Task 2"). There is no
+// dedicated platform-wide role yet — no platform_admin column, no role
+// system beyond per-org memberships — so this is a scoped approximation
+// using what actually exists today: the caller must be owner or admin in at
+// least one organization. Revisit if/when a real platform-wide admin
+// concept is introduced.
+func requirePlatformAdmin(ctx context.Context, conn db.Conn, userID uuid.UUID) error {
+	memberships, err := db.NewMembershipRepository(conn).ListForUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	for _, m := range memberships {
+		if role := auth.Role(m.Role); role == auth.RoleOwner || role == auth.RoleAdmin {
+			return nil
+		}
+	}
+	return errForbidden("viewing nodes requires an owner or admin role in at least one organization")
+}
+
 var slugSanitizer = regexp.MustCompile(`[^a-z0-9]+`)
 
 // slugify derives a URL-safe slug from a display name. Not a general-

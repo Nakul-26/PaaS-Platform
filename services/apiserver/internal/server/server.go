@@ -14,23 +14,27 @@ import (
 
 	"platform/internal/auth"
 	"platform/internal/db"
+	"platform/internal/eventbus"
 	"platform/services/apiserver/internal/workerclient"
 )
 
 // Server wires the API server's dependencies (ADR-0011 ports) into HTTP
-// handlers.
+// handlers. bus may be nil (phase-2-multi-node.md Task 6: apiserver keeps
+// serving every other route even if NATS was unreachable at startup) — only
+// handleDeploy depends on it, and checks for nil itself.
 type Server struct {
 	pool   *db.Pool
 	issuer *auth.TokenIssuer
 	worker *workerclient.Client
+	bus    eventbus.EventBus
 	logger *slog.Logger
 }
 
-func New(pool *db.Pool, issuer *auth.TokenIssuer, worker *workerclient.Client, logger *slog.Logger) *Server {
+func New(pool *db.Pool, issuer *auth.TokenIssuer, worker *workerclient.Client, bus eventbus.EventBus, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{pool: pool, issuer: issuer, worker: worker, logger: logger}
+	return &Server{pool: pool, issuer: issuer, worker: worker, bus: bus, logger: logger}
 }
 
 // Routes returns the API server's HTTP handler, ready to pass to
@@ -48,6 +52,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("GET /v1/applications/{appId}/deployments", s.authenticated(s.handleGetDeployments))
 	mux.Handle("GET /v1/applications/{appId}/logs", s.authenticated(s.handleGetLogs))
 	mux.Handle("DELETE /v1/applications/{appId}", s.authenticated(s.handleDeleteApplication))
+	mux.Handle("GET /v1/nodes", s.authenticated(s.handleGetNodes))
 
 	return mux
 }

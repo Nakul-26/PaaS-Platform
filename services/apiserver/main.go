@@ -18,6 +18,7 @@ import (
 	"platform/internal/auth"
 	"platform/internal/config"
 	"platform/internal/db"
+	"platform/internal/eventbus"
 	"platform/services/apiserver/internal/server"
 	"platform/services/apiserver/internal/workerclient"
 )
@@ -45,10 +46,25 @@ func main() {
 
 	worker := workerclient.New(config.String("WORKER_ADDR", "http://localhost:7100"))
 
+	bus := connectEventBus(ctx, logger)
+	if bus != nil {
+		if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+			Name:     eventbus.PlacementStream,
+			Subjects: []string{eventbus.PlacementStreamFilter},
+		}); err != nil {
+			logger.Error("apiserver: ensuring PLACEMENT stream, deploy route will be unavailable until restart", "error", err)
+			_ = bus.Close()
+			bus = nil
+		}
+	}
+	if bus != nil {
+		defer func() { _ = bus.Close() }()
+	}
+
 	addr := config.String("APISERVER_LISTEN_ADDR", ":8080")
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           server.New(pool, issuer, worker, logger).Routes(),
+		Handler:           server.New(pool, issuer, worker, bus, logger).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -66,5 +82,33 @@ func main() {
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("apiserver: graceful shutdown failed", "error", err)
+	}
+}
+
+// connectEventBus dials NATS with a short retry loop, mirroring the
+// worker's/scheduler's own connectEventBus — docker-compose brings nats and
+// apiserver up concurrently with no exec healthcheck to gate on. Unlike
+// scheduler (NATS is its entire job), apiserver keeps running even if this
+// never succeeds: only handleDeploy needs the bus, every other route (auth,
+// project/app CRUD, logs, node listing) has nothing to do with it, so a nil
+// bus fails just that one route (502) rather than the whole process.
+func connectEventBus(ctx context.Context, logger *slog.Logger) eventbus.EventBus {
+	url := config.String("APISERVER_NATS_URL", "nats://127.0.0.1:4222")
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		bus, err := eventbus.Connect(url)
+		if err == nil {
+			return bus
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			logger.Error("apiserver: nats not reachable, deploy route will be unavailable until restart", "url", url, "error", err)
+			return nil
+		}
+		logger.Warn("apiserver: nats not reachable yet, retrying", "url", url, "error", err)
+		select {
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
+			return nil
+		}
 	}
 }

@@ -162,6 +162,8 @@ type Deployment struct {
 	Status            string     `json:"status"`
 	Strategy          string     `json:"strategy"`
 	WorkerContainerID *string    `json:"worker_container_id,omitempty"`
+	NodeID            *string    `json:"node_id,omitempty"`
+	ContainerStatus   *string    `json:"container_status,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
 	CompletedAt       *time.Time `json:"completed_at,omitempty"`
 }
