@@ -18,6 +18,15 @@ func NodeAssignSubject(nodeID string) string {
 	return fmt.Sprintf("node.%s.assign", nodeID)
 }
 
+// NodeUnassignSubject builds the subject used to tell a specific node to
+// stop and remove one specific container (docs/nats-contract.md,
+// phase-3-controllers.md Task 2) — the mechanism that lets anything
+// (controller, apiserver) act on a container wherever it actually runs,
+// instead of a hardcoded worker address.
+func NodeUnassignSubject(nodeID string) string {
+	return fmt.Sprintf("node.%s.unassign", nodeID)
+}
+
 func NodeStatusSubject(nodeID string) string {
 	return fmt.Sprintf("node.%s.status", nodeID)
 }
@@ -33,6 +42,7 @@ const PlacementRequestedSubject = "placement.requested"
 const (
 	NodeAssignmentsStream       = "NODE_ASSIGNMENTS"
 	NodeAssignmentsStreamFilter = "node.*.assign"
+	NodeUnassignStreamFilter    = "node.*.unassign"
 
 	NodeStatusStream       = "NODE_STATUS"
 	NodeStatusStreamFilter = "node.*.status"

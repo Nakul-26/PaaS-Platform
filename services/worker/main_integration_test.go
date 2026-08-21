@@ -264,6 +264,308 @@ func TestWorker_ProcessesAssignmentOverNATS(t *testing.T) {
 	}
 }
 
+// TestWorker_DetectsCrashedContainer covers phase-3-controllers.md Task 1's
+// acceptance: a container this worker started is killed out-of-band (docker
+// kill, not the worker process), and the worker's health-check poll loop
+// (nodeagent.checkTrackedContainers) notices the status change and publishes
+// a second node.<id>.status message on its own, without any new assignment.
+func TestWorker_DetectsCrashedContainer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	rt, err := runtime.NewDockerRuntime()
+	if err != nil {
+		t.Skipf("docker daemon not available, skipping: %v", err)
+	}
+	defer func() { _ = rt.Close() }()
+
+	natsContainer, err := nats.Run(ctx, "nats:2.11.7")
+	if err != nil {
+		t.Fatalf("starting nats container: %v", err)
+	}
+	t.Cleanup(func() { _ = natsContainer.Terminate(context.Background()) })
+
+	natsURL, err := natsContainer.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("nats connection string: %v", err)
+	}
+
+	bus, err := eventbus.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connecting eventbus: %v", err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+
+	registrations := make(chan map[string]any, 4)
+	regSub, err := bus.Subscribe("node.*.register", func(msg eventbus.Message) {
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Data, &payload); err == nil {
+			registrations <- payload
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribing to node.*.register: %v", err)
+	}
+	defer func() { _ = regSub.Unsubscribe() }()
+
+	startTestWorker(t, ctx, natsURL)
+
+	var registration map[string]any
+	select {
+	case registration = <-registrations:
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for node registration message")
+	}
+	nodeID, _ := registration["node_id"].(string)
+	if nodeID == "" {
+		t.Fatalf("registration message missing node_id: %+v", registration)
+	}
+
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.NodeAssignmentsStream,
+		Subjects: []string{eventbus.NodeAssignmentsStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.NodeAssignmentsStream, err)
+	}
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.NodeStatusStream,
+		Subjects: []string{eventbus.NodeStatusStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.NodeStatusStream, err)
+	}
+
+	statuses := make(chan map[string]any, 8)
+	statusSub, err := bus.SubscribeDurable(ctx, eventbus.NodeStatusStream, "test-crash-watcher", eventbus.NodeStatusStreamFilter, func(msg eventbus.Message) error {
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Data, &payload); err == nil {
+			statuses <- payload
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribing to %s: %v", eventbus.NodeStatusStreamFilter, err)
+	}
+	defer func() { _ = statusSub.Unsubscribe() }()
+
+	const assignmentID = "test-crash-assignment-1"
+	assignData, err := json.Marshal(testAssignMessage{
+		AssignmentID: assignmentID,
+		DeploymentID: "test-crash-deployment-1",
+		Image:        "nginx:latest",
+		Ports:        []testPortBinding{{ContainerPort: 80}},
+	})
+	if err != nil {
+		t.Fatalf("marshaling assignment message: %v", err)
+	}
+	if err := bus.PublishDurable(ctx, fmt.Sprintf("node.%s.assign", nodeID), assignData); err != nil {
+		t.Fatalf("publishing assignment: %v", err)
+	}
+
+	var startStatus map[string]any
+	select {
+	case startStatus = <-statuses:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for initial node.<id>.status message")
+	}
+	if startStatus["status"] != "running" {
+		t.Fatalf("expected initial status \"running\", got %+v", startStatus)
+	}
+	containerID, _ := startStatus["container_id"].(string)
+	if containerID == "" {
+		t.Fatalf("status message missing container_id: %+v", startStatus)
+	}
+	t.Cleanup(func() {
+		_ = rt.StopContainer(context.Background(), containerID, 5*time.Second)
+		_ = rt.RemoveContainer(context.Background(), containerID)
+	})
+
+	// Kill the container directly against the real docker daemon — not the
+	// worker process — so only the health-check poll loop can notice.
+	if err := killContainer(ctx, containerID); err != nil {
+		t.Fatalf("killing container %s out-of-band: %v", containerID, err)
+	}
+
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case status := <-statuses:
+			if status["container_id"] == containerID && status["status"] == "crashed" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for worker to detect and report the crashed container")
+		}
+	}
+}
+
+// killContainer kills a container directly via the docker CLI, bypassing the
+// worker entirely — this is the "docker kill, not the worker process"
+// scenario phase-3-controllers.md's exit criteria describes.
+func killContainer(ctx context.Context, containerID string) error {
+	// #nosec G204 -- containerID comes from this test's own status message,
+	// produced by the worker it just started, not external input.
+	cmd := exec.CommandContext(ctx, "docker", "kill", containerID)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker kill: %w: %s", err, out)
+	}
+	return nil
+}
+
+// testUnassignMessage mirrors nodeagent's own (unexported) unassignMessage —
+// docs/nats-contract.md's node.<id>.unassign schema — so this test can
+// publish one without importing the worker's internal package (ADR-0012).
+type testUnassignMessage struct {
+	AssignmentID string `json:"assignment_id"`
+	ContainerID  string `json:"container_id"`
+}
+
+// TestWorker_UnassignStopsContainer covers phase-3-controllers.md Task 2's
+// acceptance: publishing a node.<id>.unassign message against a real worker +
+// Docker daemon actually stops/removes the container and produces a final
+// status: "stopped" message, without the worker process being touched.
+func TestWorker_UnassignStopsContainer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	rt, err := runtime.NewDockerRuntime()
+	if err != nil {
+		t.Skipf("docker daemon not available, skipping: %v", err)
+	}
+	defer func() { _ = rt.Close() }()
+
+	natsContainer, err := nats.Run(ctx, "nats:2.11.7")
+	if err != nil {
+		t.Fatalf("starting nats container: %v", err)
+	}
+	t.Cleanup(func() { _ = natsContainer.Terminate(context.Background()) })
+
+	natsURL, err := natsContainer.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("nats connection string: %v", err)
+	}
+
+	bus, err := eventbus.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connecting eventbus: %v", err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+
+	registrations := make(chan map[string]any, 4)
+	regSub, err := bus.Subscribe("node.*.register", func(msg eventbus.Message) {
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Data, &payload); err == nil {
+			registrations <- payload
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribing to node.*.register: %v", err)
+	}
+	defer func() { _ = regSub.Unsubscribe() }()
+
+	startTestWorker(t, ctx, natsURL)
+
+	var registration map[string]any
+	select {
+	case registration = <-registrations:
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for node registration message")
+	}
+	nodeID, _ := registration["node_id"].(string)
+	if nodeID == "" {
+		t.Fatalf("registration message missing node_id: %+v", registration)
+	}
+
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.NodeAssignmentsStream,
+		Subjects: []string{eventbus.NodeAssignmentsStreamFilter, eventbus.NodeUnassignStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.NodeAssignmentsStream, err)
+	}
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.NodeStatusStream,
+		Subjects: []string{eventbus.NodeStatusStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.NodeStatusStream, err)
+	}
+
+	statuses := make(chan map[string]any, 8)
+	statusSub, err := bus.SubscribeDurable(ctx, eventbus.NodeStatusStream, "test-unassign-watcher", eventbus.NodeStatusStreamFilter, func(msg eventbus.Message) error {
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Data, &payload); err == nil {
+			statuses <- payload
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribing to %s: %v", eventbus.NodeStatusStreamFilter, err)
+	}
+	defer func() { _ = statusSub.Unsubscribe() }()
+
+	const assignmentID = "test-unassign-assignment-1"
+	assignData, err := json.Marshal(testAssignMessage{
+		AssignmentID: assignmentID,
+		DeploymentID: "test-unassign-deployment-1",
+		Image:        "nginx:latest",
+		Ports:        []testPortBinding{{ContainerPort: 80}},
+	})
+	if err != nil {
+		t.Fatalf("marshaling assignment message: %v", err)
+	}
+	if err := bus.PublishDurable(ctx, fmt.Sprintf("node.%s.assign", nodeID), assignData); err != nil {
+		t.Fatalf("publishing assignment: %v", err)
+	}
+
+	var startStatus map[string]any
+	select {
+	case startStatus = <-statuses:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for initial node.<id>.status message")
+	}
+	if startStatus["status"] != "running" {
+		t.Fatalf("expected initial status \"running\", got %+v", startStatus)
+	}
+	containerID, _ := startStatus["container_id"].(string)
+	if containerID == "" {
+		t.Fatalf("status message missing container_id: %+v", startStatus)
+	}
+	t.Cleanup(func() {
+		_ = rt.StopContainer(context.Background(), containerID, 5*time.Second)
+		_ = rt.RemoveContainer(context.Background(), containerID)
+	})
+
+	unassignData, err := json.Marshal(testUnassignMessage{
+		AssignmentID: assignmentID,
+		ContainerID:  containerID,
+	})
+	if err != nil {
+		t.Fatalf("marshaling unassign message: %v", err)
+	}
+	if err := bus.PublishDurable(ctx, fmt.Sprintf("node.%s.unassign", nodeID), unassignData); err != nil {
+		t.Fatalf("publishing unassign: %v", err)
+	}
+
+	deadline := time.After(20 * time.Second)
+loop:
+	for {
+		select {
+		case status := <-statuses:
+			if status["container_id"] == containerID && status["status"] == "stopped" {
+				break loop
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for worker to report the unassigned container as stopped")
+		}
+	}
+
+	// Confirm against the real docker daemon that the container is actually
+	// gone, not just reported as such — RemoveContainer means ContainerStatus
+	// against it should now fail.
+	if _, err := rt.ContainerStatus(ctx, containerID); err == nil {
+		t.Fatalf("expected container %s to be removed from the docker daemon after unassign, but it still exists", containerID)
+	}
+}
+
 // startTestWorker builds and runs the real worker binary as a separate OS
 // process (ADR-0012), pointed at natsURL with a fast heartbeat interval so
 // the test doesn't wait on the 5s production default.
@@ -294,6 +596,7 @@ func startTestWorker(t *testing.T, ctx context.Context, natsURL string) {
 		"WORKER_NATS_URL="+natsURL,
 		"WORKER_NODE_ID_FILE="+nodeIDFile,
 		"WORKER_HEARTBEAT_INTERVAL=1s",
+		"WORKER_HEALTH_CHECK_INTERVAL=1s",
 		"WORKER_CPU_CAPACITY_MILLICORES=1500",
 	)
 	var output bytes.Buffer

@@ -28,6 +28,13 @@ type portBinding struct {
 	Protocol      string `json:"protocol,omitempty"`
 }
 
+// unassignMessage is node.<id>.unassign's payload (docs/nats-contract.md,
+// phase-3-controllers.md Task 2).
+type unassignMessage struct {
+	AssignmentID string `json:"assignment_id"`
+	ContainerID  string `json:"container_id"`
+}
+
 // statusMessage is node.<id>.status's payload. status uses containers.status'
 // vocabulary (pending|running|crashed|stopped, database-schema.md §2) —
 // deliberately not internal/runtime.Status's own vocabulary
@@ -50,7 +57,7 @@ type statusMessage struct {
 func (a *Agent) subscribeAssignments(ctx context.Context) (eventbus.Subscription, error) {
 	if err := a.bus.EnsureStream(ctx, eventbus.StreamConfig{
 		Name:     eventbus.NodeAssignmentsStream,
-		Subjects: []string{eventbus.NodeAssignmentsStreamFilter},
+		Subjects: []string{eventbus.NodeAssignmentsStreamFilter, eventbus.NodeUnassignStreamFilter},
 	}); err != nil {
 		return nil, fmt.Errorf("ensuring %s stream: %w", eventbus.NodeAssignmentsStream, err)
 	}
@@ -67,6 +74,22 @@ func (a *Agent) subscribeAssignments(ctx context.Context) (eventbus.Subscription
 
 	return a.bus.SubscribeDurable(ctx, eventbus.NodeAssignmentsStream, consumerName, subject, func(msg eventbus.Message) error {
 		a.handleAssignment(ctx, msg.Data)
+		return nil
+	})
+}
+
+// subscribeUnassign subscribes this node to its own node.<id>.unassign
+// subject (phase-3-controllers.md Task 2). Shares the NODE_ASSIGNMENTS
+// stream with node.<id>.assign (both ensured by subscribeAssignments, which
+// Run always calls first) since both are assignment-lifecycle messages with
+// the same loss-unacceptable reasoning (docs/nats-contract.md).
+func (a *Agent) subscribeUnassign(ctx context.Context) (eventbus.Subscription, error) {
+	nodeID := a.cfg.NodeID.String()
+	consumerName := fmt.Sprintf("worker-%s-unassign", nodeID)
+	subject := eventbus.NodeUnassignSubject(nodeID)
+
+	return a.bus.SubscribeDurable(ctx, eventbus.NodeAssignmentsStream, consumerName, subject, func(msg eventbus.Message) error {
+		a.handleUnassign(ctx, msg.Data)
 		return nil
 	})
 }
@@ -90,8 +113,81 @@ func (a *Agent) handleAssignment(ctx context.Context, data []byte) {
 		return
 	}
 
+	status := containerStatus(info)
 	a.logger.Info("assignment started", "assignment_id", msg.AssignmentID, "container_id", info.ID, "image", msg.Image)
-	a.publishStatus(ctx, msg.AssignmentID, info.ID, containerStatus(info), info.ExitCode)
+	a.publishStatus(ctx, msg.AssignmentID, info.ID, status, info.ExitCode)
+
+	a.mu.Lock()
+	a.tracked[msg.AssignmentID] = &trackedContainer{containerID: info.ID, lastStatus: status}
+	a.mu.Unlock()
+}
+
+// handleUnassign stops and removes one specific container
+// (docs/nats-contract.md's node.<id>.unassign, phase-3-controllers.md Task 2)
+// — the mechanism that lets anything (controller, apiserver) act on a
+// container wherever it actually runs, instead of a hardcoded worker address.
+// Stop/remove errors are logged, not treated as fatal to this handler: an
+// unassign racing a crash that Task 1's poll already caught (container
+// already stopped/gone) should still converge to a final "stopped" status
+// and stop tracking, not get stuck retrying.
+func (a *Agent) handleUnassign(ctx context.Context, data []byte) {
+	var msg unassignMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		a.logger.Error("decoding unassign message", "error", err)
+		return
+	}
+
+	if err := a.rt.StopContainer(ctx, msg.ContainerID, 10*time.Second); err != nil {
+		a.logger.Warn("stopping container for unassign", "assignment_id", msg.AssignmentID, "container_id", msg.ContainerID, "error", err)
+	}
+	if err := a.rt.RemoveContainer(ctx, msg.ContainerID); err != nil {
+		a.logger.Warn("removing container for unassign", "assignment_id", msg.AssignmentID, "container_id", msg.ContainerID, "error", err)
+	}
+
+	a.logger.Info("container unassigned", "assignment_id", msg.AssignmentID, "container_id", msg.ContainerID)
+	a.publishStatus(ctx, msg.AssignmentID, msg.ContainerID, "stopped", 0)
+
+	a.mu.Lock()
+	delete(a.tracked, msg.AssignmentID)
+	a.mu.Unlock()
+}
+
+// checkTrackedContainers polls every container this worker started
+// (phase-3-controllers.md Task 1) and republishes node.<id>.status only when
+// the observed status has changed since the last check — a container killed
+// out-of-band (docker kill, not the worker process) is otherwise never
+// noticed, since handleAssignment only publishes once, at start. Recovering
+// tracking after a worker *process* restart is explicitly out of scope (the
+// map is in-memory only; see phase-3-controllers.md's "Explicitly deferred").
+func (a *Agent) checkTrackedContainers(ctx context.Context) {
+	a.mu.Lock()
+	snapshot := make(map[string]trackedContainer, len(a.tracked))
+	for assignmentID, tc := range a.tracked {
+		snapshot[assignmentID] = *tc
+	}
+	a.mu.Unlock()
+
+	for assignmentID, tc := range snapshot {
+		info, err := a.rt.ContainerStatus(ctx, tc.containerID)
+		if err != nil {
+			a.logger.Error("checking tracked container health", "assignment_id", assignmentID, "container_id", tc.containerID, "error", err)
+			continue
+		}
+
+		status := containerStatus(info)
+		if status == tc.lastStatus {
+			continue
+		}
+
+		a.logger.Info("tracked container status changed", "assignment_id", assignmentID, "container_id", tc.containerID, "from", tc.lastStatus, "to", status)
+		a.publishStatus(ctx, assignmentID, tc.containerID, status, info.ExitCode)
+
+		a.mu.Lock()
+		if current, ok := a.tracked[assignmentID]; ok {
+			current.lastStatus = status
+		}
+		a.mu.Unlock()
+	}
 }
 
 func (a *Agent) startAssignedContainer(ctx context.Context, msg assignMessage) (runtime.ContainerStatusInfo, error) {

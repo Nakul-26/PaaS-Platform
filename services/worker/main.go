@@ -123,6 +123,7 @@ func runNodeAgent(ctx context.Context, bus eventbus.EventBus, rt runtime.Contain
 		CPUCapacityMillicores: config.Int("WORKER_CPU_CAPACITY_MILLICORES", 2000),
 		MemoryCapacityMB:      config.Int("WORKER_MEMORY_CAPACITY_MB", 2048),
 		HeartbeatInterval:     config.Duration("WORKER_HEARTBEAT_INTERVAL", 5*time.Second),
+		HealthCheckInterval:   config.Duration("WORKER_HEALTH_CHECK_INTERVAL", 3*time.Second),
 	}, logger)
 
 	logger.Info("worker: starting node agent", "node_id", nodeID, "hostname", hostname, "ip", ip)

@@ -48,6 +48,11 @@ type ApplicationRepository interface {
 	// UpdateImage records a new desired-state image (a deploy updates what
 	// the application *should* be running, database-schema.md §2).
 	UpdateImage(ctx context.Context, id uuid.UUID, image string) error
+	// UpdateReplicas records a new desired replica count (a scale request
+	// updates what the application *should* be running, same as UpdateImage;
+	// phase-3-controllers.md Tasks 3/5). It only updates desired state — the
+	// Deployment controller (Task 4) is what actually reconciles toward it.
+	UpdateReplicas(ctx context.Context, id uuid.UUID, replicas int) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
@@ -122,6 +127,20 @@ func (r *applicationRepository) UpdateImage(ctx context.Context, id uuid.UUID, i
 	)
 	if err != nil {
 		return fmt.Errorf("updating application image: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *applicationRepository) UpdateReplicas(ctx context.Context, id uuid.UUID, replicas int) error {
+	tag, err := r.conn.Exec(ctx,
+		`UPDATE applications SET replicas_desired = $2, updated_at = now() WHERE id = $1`,
+		id, replicas,
+	)
+	if err != nil {
+		return fmt.Errorf("updating application replicas: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

@@ -12,6 +12,7 @@ All payloads are JSON; timestamps are RFC 3339 UTC, matching `api-conventions.md
 | `node.<id>.heartbeat` | Core NATS | Lossy-tolerant by nature (ADR-0005) — a single dropped heartbeat doesn't matter, only a *sustained* gap does, and that's what the unreachable-timeout in Task 5 detects. |
 | `placement.requested` | JetStream (stream `PLACEMENT`) | A lost placement request strands a deployment in `pending` forever with nothing to retry it — loss is unacceptable. |
 | `node.<id>.assign` | JetStream (stream `NODE_ASSIGNMENTS`) | Same reasoning as above: a lost assignment means the scheduler *thinks* it placed work that never actually started. |
+| `node.<id>.unassign` | JetStream (stream `NODE_ASSIGNMENTS`) | Same reasoning as `node.<id>.assign`: a lost unassign leaves a container running that the control plane thinks is gone. |
 | `node.<id>.status` | JetStream (stream `NODE_STATUS`) | Status transitions (esp. `running` → `crashed`) are the state-change events ADR-0005 calls out by name; losing one hides a real failure from the control plane until the next reconcile. |
 
 Every JetStream-backed read path here still needs the Postgres reconcile-fallback R7 requires — NATS being down must degrade placement/status visibility, not corrupt it. That fallback is each subject's consuming service's responsibility (scheduler for `NODE_STATUS`/`PLACEMENT`, worker for `NODE_ASSIGNMENTS`), not this contract's.
@@ -82,6 +83,19 @@ Published by `scheduler` to the specific node it placed the work on, after writi
 
 `assignment_id` correlates this message with the `node.<id>.status` updates it produces. Consumed by: `worker` (drives the same `ContainerRuntime` start path its HTTP `POST /v1/containers` handler already uses).
 
+### `node.<id>.unassign`
+
+Published to the specific node a container actually runs on, to stop and remove that one container — the piece that lets anything (controller, apiserver) act on a container wherever it actually runs, instead of a hardcoded worker address (`phase-3-controllers.md` Task 2).
+
+```json
+{
+  "assignment_id": "f7a9...",
+  "container_id": "a1b2c3..."
+}
+```
+
+Consumed by: `worker` (drives the same `ContainerRuntime` stop/remove path its HTTP `DELETE`/stop handlers already use, then stops tracking the assignment for health-check polling — Task 1's map). Always publishes a final `node.<id>.status` message with `status: "stopped"`, even if the container was already stopped or gone by the time this runs — an unassign for an already-crashed container still converges to `stopped`, not an error.
+
 ### `node.<id>.status`
 
 Published by a worker after acting on a `node.<id>.assign` message, and again on any subsequent status transition it observes for that container (e.g. a later crash).
@@ -103,7 +117,7 @@ Published by a worker after acting on a `node.<id>.assign` message, and again on
 | Stream | Subjects | Retention |
 |---|---|---|
 | `PLACEMENT` | `placement.requested` | Limits (default JetStream retention — a request is consumed once by the single scheduler instance) |
-| `NODE_ASSIGNMENTS` | `node.*.assign` | Limits |
+| `NODE_ASSIGNMENTS` | `node.*.assign`, `node.*.unassign` | Limits |
 | `NODE_STATUS` | `node.*.status` | Limits |
 
 Each service that publishes on a JetStream subject is responsible for calling `EventBus.EnsureStream` for it at startup (idempotent — `CreateOrUpdateStream`), so no separate provisioning step is required.

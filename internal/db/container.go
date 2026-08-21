@@ -52,6 +52,10 @@ type ContainerRepository interface {
 	// ListByNode backs the scheduler's load-scoring step (Task 5's
 	// filter-then-score: score candidate nodes by current load).
 	ListByNode(ctx context.Context, nodeID uuid.UUID) ([]Container, error)
+	// CountActiveByDeployment counts a deployment's 'pending'+'running'
+	// containers — the "actual" side of the Deployment controller's diff
+	// against applications.replicas_desired (phase-3-controllers.md Tasks 3/4).
+	CountActiveByDeployment(ctx context.Context, deploymentID uuid.UUID) (int, error)
 }
 
 type containerRepository struct{ conn Conn }
@@ -130,6 +134,18 @@ func (r *containerRepository) ListByNode(ctx context.Context, nodeID uuid.UUID) 
 	}
 	defer rows.Close()
 	return scanContainers(rows)
+}
+
+func (r *containerRepository) CountActiveByDeployment(ctx context.Context, deploymentID uuid.UUID) (int, error) {
+	var count int
+	err := r.conn.QueryRow(ctx,
+		`SELECT count(*) FROM containers WHERE deployment_id = $1 AND status IN ('pending', 'running')`,
+		deploymentID,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("counting active containers: %w", err)
+	}
+	return count, nil
 }
 
 func scanContainers(rows pgx.Rows) ([]Container, error) {

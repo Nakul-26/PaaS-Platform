@@ -5,6 +5,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -63,7 +64,7 @@ func TestNodeAndContainerRepositories(t *testing.T) {
 		t.Fatalf("applying migrations: %v", err)
 	}
 
-	deploymentID := seedDeployment(t, ctx, adminDB)
+	orgID, userID, deploymentID, applicationID := seedDeployment(t, ctx, adminDB)
 
 	endpoint, err := container.PortEndpoint(ctx, "5432/tcp", "")
 	if err != nil {
@@ -121,6 +122,14 @@ func TestNodeAndContainerRepositories(t *testing.T) {
 		t.Fatalf("expected new container pending, got %s", c.Status)
 	}
 
+	active, err := containers.CountActiveByDeployment(ctx, deploymentID)
+	if err != nil {
+		t.Fatalf("CountActiveByDeployment (pending): %v", err)
+	}
+	if active != 1 {
+		t.Fatalf("expected 1 active container while pending, got %d", active)
+	}
+
 	runtimeID := "abc123"
 	if err := containers.UpdateStatus(ctx, c.ID, ContainerStatusRunning, &runtimeID); err != nil {
 		t.Fatalf("UpdateStatus: %v", err)
@@ -131,6 +140,14 @@ func TestNodeAndContainerRepositories(t *testing.T) {
 	}
 	if c.Status != ContainerStatusRunning || c.ContainerRuntimeID == nil || *c.ContainerRuntimeID != runtimeID || c.StartedAt == nil {
 		t.Fatalf("unexpected container after UpdateStatus: %+v", c)
+	}
+
+	active, err = containers.CountActiveByDeployment(ctx, deploymentID)
+	if err != nil {
+		t.Fatalf("CountActiveByDeployment (running): %v", err)
+	}
+	if active != 1 {
+		t.Fatalf("expected 1 active container while running, got %d", active)
 	}
 
 	byDeployment, err := containers.ListByDeployment(ctx, deploymentID)
@@ -162,15 +179,58 @@ func TestNodeAndContainerRepositories(t *testing.T) {
 	if c.ContainerRuntimeID == nil || *c.ContainerRuntimeID != runtimeID {
 		t.Fatalf("expected container_runtime_id to survive a nil-runtime-id update, got %v", c.ContainerRuntimeID)
 	}
+
+	active, err = containers.CountActiveByDeployment(ctx, deploymentID)
+	if err != nil {
+		t.Fatalf("CountActiveByDeployment (stopped): %v", err)
+	}
+	if active != 0 {
+		t.Fatalf("expected 0 active containers once stopped, got %d", active)
+	}
+
+	// ApplicationRepository.Get requires app.current_org_id set (ADR-0010),
+	// so this runs inside a WithTx session scoped to the seeded org/user,
+	// matching how apiserver's handlers use it.
+	err = pool.WithTx(ctx, userID, orgID, func(ctx context.Context, conn Conn) error {
+		applications := NewApplicationRepository(conn)
+
+		app, err := applications.Get(ctx, applicationID)
+		if err != nil {
+			return fmt.Errorf("Get application: %w", err)
+		}
+		if app.ReplicasDesired != 1 {
+			return fmt.Errorf("expected default replicas_desired 1, got %d", app.ReplicasDesired)
+		}
+		if err := applications.UpdateReplicas(ctx, applicationID, 3); err != nil {
+			return fmt.Errorf("UpdateReplicas: %w", err)
+		}
+		app, err = applications.Get(ctx, applicationID)
+		if err != nil {
+			return fmt.Errorf("Get application after UpdateReplicas: %w", err)
+		}
+		if app.ReplicasDesired != 3 {
+			return fmt.Errorf("expected replicas_desired 3 after UpdateReplicas, got %d", app.ReplicasDesired)
+		}
+
+		if err := applications.UpdateReplicas(ctx, uuid.New(), 5); !errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("expected ErrNotFound updating replicas for unknown application, got %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("application RLS session: %v", err)
+	}
 }
 
 // seedDeployment inserts one organization/user/project/application/deployment
 // row (as the admin, bypassing RLS) so a containers row has a real
-// deployment_id fk to point at.
-func seedDeployment(t *testing.T, ctx context.Context, adminDB *sql.DB) uuid.UUID {
+// deployment_id fk to point at. Returns both IDs since Task 3's
+// ApplicationRepository.UpdateReplicas coverage needs the org/user too, to
+// scope the RLS session ApplicationRepository.Get requires (ADR-0010).
+func seedDeployment(t *testing.T, ctx context.Context, adminDB *sql.DB) (orgID, userID, deploymentID, applicationID uuid.UUID) {
 	t.Helper()
 
-	var orgID, userID, projectID, applicationID, deploymentID uuid.UUID
+	var projectID uuid.UUID
 	if err := adminDB.QueryRowContext(ctx,
 		`INSERT INTO organizations (name, slug) VALUES ('Org', 'org') RETURNING id`,
 	).Scan(&orgID); err != nil {
@@ -198,5 +258,5 @@ func seedDeployment(t *testing.T, ctx context.Context, adminDB *sql.DB) uuid.UUI
 	).Scan(&deploymentID); err != nil {
 		t.Fatalf("seeding deployment: %v", err)
 	}
-	return deploymentID
+	return orgID, userID, deploymentID, applicationID
 }

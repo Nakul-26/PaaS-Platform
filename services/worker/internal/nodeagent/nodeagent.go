@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,6 +29,18 @@ type Config struct {
 	MemoryCapacityMB      int
 	Labels                map[string]string
 	HeartbeatInterval     time.Duration
+	// HealthCheckInterval is how often tracked containers (phase-3-controllers.md
+	// Task 1) are polled for a status change. A placeholder default (3s, see
+	// main.go) until Phase 10's load-testing pass tunes it for real (§9 R9).
+	HealthCheckInterval time.Duration
+}
+
+// trackedContainer is what health-check polling needs to detect a status
+// change for one assignment: which container to inspect, and the status it
+// last reported so a poll only republishes on an actual transition.
+type trackedContainer struct {
+	containerID string
+	lastStatus  string
 }
 
 // Agent owns the register/heartbeat/assign loop for one worker process.
@@ -36,13 +49,16 @@ type Agent struct {
 	rt     runtime.ContainerRuntime
 	cfg    Config
 	logger *slog.Logger
+
+	mu      sync.Mutex
+	tracked map[string]*trackedContainer // assignment_id -> tracked container
 }
 
 func New(bus eventbus.EventBus, rt runtime.ContainerRuntime, cfg Config, logger *slog.Logger) *Agent {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Agent{bus: bus, rt: rt, cfg: cfg, logger: logger}
+	return &Agent{bus: bus, rt: rt, cfg: cfg, logger: logger, tracked: make(map[string]*trackedContainer)}
 }
 
 type registerMessage struct {
@@ -60,13 +76,14 @@ type heartbeatMessage struct {
 }
 
 // Run publishes this worker's registration once, subscribes to its own
-// node.<id>.assign subject, then heartbeats on cfg.HeartbeatInterval until
-// ctx is done. Register/heartbeat publish failures are logged, not fatal:
-// both subjects are core NATS (docs/nats-contract.md's transport table)
-// precisely because a lost message here is self-healing — the next
-// heartbeat re-establishes the node. Failing to set up the assign
-// subscription, by contrast, is fatal to Run: without it this worker can
-// never receive placements, which is Task 4's entire point.
+// node.<id>.assign and node.<id>.unassign subjects, then heartbeats on
+// cfg.HeartbeatInterval (and polls tracked containers on
+// cfg.HealthCheckInterval) until ctx is done. Register/heartbeat publish
+// failures are logged, not fatal: both subjects are core NATS
+// (docs/nats-contract.md's transport table) precisely because a lost message
+// here is self-healing — the next heartbeat re-establishes the node. Failing
+// to set up either subscription, by contrast, is fatal to Run: without them
+// this worker can never receive placements or releases.
 func (a *Agent) Run(ctx context.Context) error {
 	if err := a.publishRegister(ctx); err != nil {
 		a.logger.Error("publishing node registration", "node_id", a.cfg.NodeID, "error", err)
@@ -80,8 +97,21 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	defer func() { _ = assignSub.Unsubscribe() }()
 
+	unassignSub, err := a.subscribeUnassign(ctx)
+	if err != nil {
+		return fmt.Errorf("subscribing to unassign: %w", err)
+	}
+	defer func() { _ = unassignSub.Unsubscribe() }()
+
 	ticker := time.NewTicker(a.cfg.HeartbeatInterval)
 	defer ticker.Stop()
+
+	healthInterval := a.cfg.HealthCheckInterval
+	if healthInterval <= 0 {
+		healthInterval = 3 * time.Second
+	}
+	healthTicker := time.NewTicker(healthInterval)
+	defer healthTicker.Stop()
 
 	for {
 		select {
@@ -91,6 +121,8 @@ func (a *Agent) Run(ctx context.Context) error {
 			if err := a.publishHeartbeat(ctx); err != nil {
 				a.logger.Error("publishing node heartbeat", "node_id", a.cfg.NodeID, "error", err)
 			}
+		case <-healthTicker.C:
+			a.checkTrackedContainers(ctx)
 		}
 	}
 }
