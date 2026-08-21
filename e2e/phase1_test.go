@@ -211,7 +211,10 @@ func startNATS(t *testing.T, ctx context.Context) string {
 // process. Unlike startService, it has no HTTP surface to poll for
 // readiness — the scheduler is entirely NATS/Postgres-driven — so this just
 // starts it and lets the deploy step further down give it time to catch up.
-func startScheduler(t *testing.T, ctx context.Context, goBin, binDir, dbURL, natsURL string) {
+// extraEnv lets callers override the scheduler's own tunables (e.g. Phase
+// 2's exit-criteria test speeds up the liveness sweep so it doesn't have to
+// wait out the 15s/5s production defaults for a killed node to drop out).
+func startScheduler(t *testing.T, ctx context.Context, goBin, binDir, dbURL, natsURL string, extraEnv ...string) {
 	t.Helper()
 
 	binPath := filepath.Join(binDir, "scheduler"+exeSuffix())
@@ -220,7 +223,7 @@ func startScheduler(t *testing.T, ctx context.Context, goBin, binDir, dbURL, nat
 	// #nosec G204 -- binPath is a binary this same test just built into
 	// t.TempDir(), not external input.
 	cmd := exec.CommandContext(ctx, binPath)
-	cmd.Env = append(os.Environ(), "APP_DATABASE_URL="+dbURL, "SCHEDULER_NATS_URL="+natsURL)
+	cmd.Env = append(append(os.Environ(), "APP_DATABASE_URL="+dbURL, "SCHEDULER_NATS_URL="+natsURL), extraEnv...)
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
