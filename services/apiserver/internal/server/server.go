@@ -51,6 +51,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /v1/applications/{appId}/deployments", s.authenticated(s.handleDeploy))
 	mux.Handle("GET /v1/applications/{appId}/deployments", s.authenticated(s.handleGetDeployments))
 	mux.Handle("GET /v1/applications/{appId}/logs", s.authenticated(s.handleGetLogs))
+	mux.Handle("PATCH /v1/applications/{appId}", s.authenticated(s.handleScaleApplication))
 	mux.Handle("DELETE /v1/applications/{appId}", s.authenticated(s.handleDeleteApplication))
 	mux.Handle("GET /v1/nodes", s.authenticated(s.handleGetNodes))
 

@@ -33,6 +33,7 @@ func Execute() int {
 		newLoginCmd(),
 		newCreateCmd(),
 		newDeployCmd(),
+		newScaleCmd(),
 		newGetCmd(),
 		newLogsCmd(),
 		newDeleteCmd(),

@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -44,17 +45,18 @@ func newGetDeploymentsCmd() *cobra.Command {
 				return nil
 			}
 			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-			_, _ = fmt.Fprintln(tw, "REVISION\tSTATUS\tIMAGE\tNODE\tCONTAINER_STATUS\tCREATED_AT")
+			_, _ = fmt.Fprintln(tw, "REVISION\tSTATUS\tIMAGE\tREPLICAS\tNODES\tCREATED_AT")
 			for _, d := range page.Data {
-				node := "-"
-				if d.NodeID != nil {
-					node = *d.NodeID
+				nodes := "-"
+				if len(d.Containers) > 0 {
+					ids := make([]string, len(d.Containers))
+					for i, c := range d.Containers {
+						ids[i] = c.NodeID
+					}
+					nodes = strings.Join(ids, ",")
 				}
-				containerStatus := "-"
-				if d.ContainerStatus != nil {
-					containerStatus = *d.ContainerStatus
-				}
-				_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", d.Revision, d.Status, d.Image, node, containerStatus, d.CreatedAt.Format("2006-01-02T15:04:05Z"))
+				replicas := fmt.Sprintf("%d/%d", d.ReplicasRunning, d.ReplicasDesired)
+				_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", d.Revision, d.Status, d.Image, replicas, nodes, d.CreatedAt.Format("2006-01-02T15:04:05Z"))
 			}
 			return tw.Flush()
 		},

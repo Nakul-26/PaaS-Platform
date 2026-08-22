@@ -58,6 +58,21 @@ func main() {
 		}
 	}
 	if bus != nil {
+		// Idempotent (scheduler/worker/controller-manager each also call this
+		// with the same subjects at their own startup — whichever service
+		// starts first wins, harmlessly). Needed as of Task 6
+		// (phase-3-controllers.md): handleDeleteApplication now publishes
+		// node.<id>.unassign instead of calling a hardcoded worker address.
+		if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+			Name:     eventbus.NodeAssignmentsStream,
+			Subjects: []string{eventbus.NodeAssignmentsStreamFilter, eventbus.NodeUnassignStreamFilter},
+		}); err != nil {
+			logger.Error("apiserver: ensuring NODE_ASSIGNMENTS stream, delete route will be unavailable until restart", "error", err)
+			_ = bus.Close()
+			bus = nil
+		}
+	}
+	if bus != nil {
 		defer func() { _ = bus.Close() }()
 	}
 

@@ -154,18 +154,25 @@ func (c *Client) CreateApplication(ctx context.Context, projectID, name, image s
 	return a, err
 }
 
+// ContainerSummary is one replica of a Deployment — see Deployment.Containers.
+type ContainerSummary struct {
+	NodeID string `json:"node_id"`
+	Status string `json:"status"`
+}
+
 type Deployment struct {
-	ID                string     `json:"id"`
-	ApplicationID     string     `json:"application_id"`
-	Image             string     `json:"image"`
-	Revision          int        `json:"revision"`
-	Status            string     `json:"status"`
-	Strategy          string     `json:"strategy"`
-	WorkerContainerID *string    `json:"worker_container_id,omitempty"`
-	NodeID            *string    `json:"node_id,omitempty"`
-	ContainerStatus   *string    `json:"container_status,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
-	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+	ID                string             `json:"id"`
+	ApplicationID     string             `json:"application_id"`
+	Image             string             `json:"image"`
+	Revision          int                `json:"revision"`
+	Status            string             `json:"status"`
+	Strategy          string             `json:"strategy"`
+	WorkerContainerID *string            `json:"worker_container_id,omitempty"`
+	ReplicasDesired   int                `json:"replicas_desired"`
+	ReplicasRunning   int                `json:"replicas_running"`
+	Containers        []ContainerSummary `json:"containers,omitempty"`
+	CreatedAt         time.Time          `json:"created_at"`
+	CompletedAt       *time.Time         `json:"completed_at,omitempty"`
 }
 
 // Deploy triggers a deployment for appID. image may be empty to redeploy
@@ -196,6 +203,18 @@ func (c *Client) ListDeployments(ctx context.Context, appID string) (DeploymentP
 
 func (c *Client) DeleteApplication(ctx context.Context, appID string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/applications/"+appID, nil, nil)
+}
+
+// ScaleApplication updates appID's desired replica count. It does not wait
+// for the change to take effect — the Deployment controller reconciles
+// toward it on its own tick (phase-3-controllers.md Task 5).
+func (c *Client) ScaleApplication(ctx context.Context, appID string, replicas int) (Application, error) {
+	body, _ := json.Marshal(struct {
+		ReplicasDesired int `json:"replicas_desired"`
+	}{replicas})
+	var a Application
+	err := c.do(ctx, http.MethodPatch, "/v1/applications/"+appID, body, &a)
+	return a, err
 }
 
 // Node mirrors handlers_nodes.go's nodeResponse (Task 7).

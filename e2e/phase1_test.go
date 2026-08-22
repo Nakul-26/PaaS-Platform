@@ -63,7 +63,7 @@ func TestE2E_Phase1ExitCriteria(t *testing.T) {
 	goBin := goBinary(t)
 	binDir := t.TempDir()
 
-	dbURL := startPostgres(t, ctx)
+	_, dbURL := startPostgres(t, ctx)
 	natsURL := startNATS(t, ctx)
 	// phase-2-multi-node.md Task 6 changed deploy from a synchronous HTTP
 	// call to the worker into an event-driven placement.requested publish —
@@ -132,11 +132,15 @@ func TestE2E_Phase1ExitCriteria(t *testing.T) {
 }
 
 // startPostgres spins up a real Postgres testcontainer with all migrations
-// applied, returning a connection string for the platform_app role — the
-// same role the apiserver process connects as in production — so RLS is
-// actually enforced end-to-end (ADR-0010), exactly as it would be for a
-// real deployment.
-func startPostgres(t *testing.T, ctx context.Context) string {
+// applied, returning both the admin (superuser) connection string —
+// controller-manager connects as this, ARCHITECTURE.md's documented
+// RLS-bypass exception for cross-tenant reconciliation, same as
+// services/controller-manager/main_integration_test.go's own
+// startTestPostgres — and the platform_app role connection string, the
+// same role apiserver/scheduler/worker connect as in production, so RLS is
+// actually enforced end-to-end (ADR-0010) for everything except the
+// controller.
+func startPostgres(t *testing.T, ctx context.Context) (adminDSN, appDSN string) {
 	t.Helper()
 
 	container, err := postgres.Run(ctx, "postgres:16-alpine",
@@ -185,7 +189,7 @@ func startPostgres(t *testing.T, ctx context.Context) string {
 	if err != nil {
 		t.Fatalf("resolving container endpoint: %v", err)
 	}
-	return fmt.Sprintf("postgres://platform_app:platform_app@%s/platform?sslmode=disable", endpoint)
+	return adminConnStr, fmt.Sprintf("postgres://platform_app:platform_app@%s/platform?sslmode=disable", endpoint)
 }
 
 // startNATS starts a real NATS/JetStream testcontainer and returns its

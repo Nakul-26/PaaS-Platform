@@ -17,6 +17,13 @@ import (
 	"platform/internal/eventbus"
 )
 
+// containerSummaryDTO is one row of a deployment's replica summary — see
+// deploymentResponse.Containers.
+type containerSummaryDTO struct {
+	NodeID string `json:"node_id"`
+	Status string `json:"status"`
+}
+
 type deploymentResponse struct {
 	ID            string `json:"id"`
 	ApplicationID string `json:"application_id"`
@@ -26,14 +33,19 @@ type deploymentResponse struct {
 	Strategy      string `json:"strategy"`
 	// WorkerContainerID is a Phase 1 relic — handleDeploy no longer calls
 	// the worker synchronously (Task 6: event-driven placement), so this is
-	// always nil going forward. NodeID/ContainerStatus (populated via a join
-	// through containers) are its Task 6 replacement — see
-	// attachPlacement.
-	WorkerContainerID *string    `json:"worker_container_id,omitempty"`
-	NodeID            *string    `json:"node_id,omitempty"`
-	ContainerStatus   *string    `json:"container_status,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
-	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+	// always nil going forward.
+	WorkerContainerID *string `json:"worker_container_id,omitempty"`
+	// ReplicasDesired/ReplicasRunning/Containers (populated via a join
+	// through containers — see attachReplicaState) are Task 7's replacement
+	// for Phase 2's single NodeID/ContainerStatus pair, which assumed
+	// exactly one container per deployment — no longer true once an
+	// application can scale (Task 5) or a crashed replica gets replaced
+	// (Task 4) alongside still-healthy ones.
+	ReplicasDesired int                   `json:"replicas_desired"`
+	ReplicasRunning int                   `json:"replicas_running"`
+	Containers      []containerSummaryDTO `json:"containers,omitempty"`
+	CreatedAt       time.Time             `json:"created_at"`
+	CompletedAt     *time.Time            `json:"completed_at,omitempty"`
 }
 
 func toDeploymentResponse(d db.Deployment) deploymentResponse {
@@ -44,22 +56,25 @@ func toDeploymentResponse(d db.Deployment) deploymentResponse {
 	}
 }
 
-// attachPlacement fills in resp's NodeID/ContainerStatus from the most
-// recent containers row for deploymentID, if the scheduler has placed one
-// yet (phase-2-multi-node.md Task 6: "surface which node a deployment
-// landed on, via a join through containers").
-func attachPlacement(ctx context.Context, containers db.ContainerRepository, deploymentID uuid.UUID, resp *deploymentResponse) error {
+// attachReplicaState fills in resp's replica summary — desiredReplicas
+// (applications.replicas_desired) against every containers row currently
+// recorded for deploymentID, regardless of how many there are (Task 7,
+// phase-3-controllers.md: "show a replica summary ... instead of assuming
+// one container per deployment").
+func attachReplicaState(ctx context.Context, containers db.ContainerRepository, deploymentID uuid.UUID, desiredReplicas int, resp *deploymentResponse) error {
 	rows, err := containers.ListByDeployment(ctx, deploymentID)
 	if err != nil {
 		return err
 	}
-	if len(rows) == 0 {
-		return nil
+	resp.ReplicasDesired = desiredReplicas
+	summaries := make([]containerSummaryDTO, len(rows))
+	for i, cn := range rows {
+		summaries[i] = containerSummaryDTO{NodeID: cn.NodeID.String(), Status: string(cn.Status)}
+		if cn.Status == db.ContainerStatusRunning {
+			resp.ReplicasRunning++
+		}
 	}
-	nodeID := rows[0].NodeID.String()
-	status := string(rows[0].Status)
-	resp.NodeID = &nodeID
-	resp.ContainerStatus = &status
+	resp.Containers = summaries
 	return nil
 }
 
@@ -73,7 +88,7 @@ type deployRequest struct {
 // publishes placement.requested, matching ARCHITECTURE.md §2.1 ("the API
 // server does not talk to workers directly"). Actual placement is the
 // scheduler's job (Task 5); poll GET .../deployments to observe it land, via
-// attachPlacement's join through containers.
+// attachReplicaState's join through containers.
 func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	userID, _ := auth.UserIDFromContext(r.Context())
 	appID, err := uuid.Parse(r.PathValue("appId"))
@@ -139,7 +154,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	// successful publish leaves the row exactly as Create left it
 	// ('pending') — the scheduler and worker don't report back onto
 	// deployments at all, only onto containers (docs/nats-contract.md), so
-	// attachPlacement's join through containers is the actual source of
+	// attachReplicaState's join through containers is the actual source of
 	// live placement status from here on, not this row.
 	ports := make([]portBinding, len(app.Ports))
 	for i, p := range app.Ports {
@@ -174,7 +189,12 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, toDeploymentResponse(deployment))
+	// No containers exist for this deployment yet (placement is async —
+	// the scheduler hasn't acted on the publish above yet), so the replica
+	// summary starts at 0/desired with no containers listed.
+	resp := toDeploymentResponse(deployment)
+	resp.ReplicasDesired = app.ReplicasDesired
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 // handleGetDeployments is GET /v1/applications/:appId/deployments,
@@ -202,7 +222,8 @@ func (s *Server) handleGetDeployments(w http.ResponseWriter, r *http.Request) {
 	var deployments []db.Deployment
 	var data []deploymentResponse
 	err = s.pool.WithTx(r.Context(), userID, uuid.Nil, func(ctx context.Context, conn db.Conn) error {
-		orgID, err := db.NewApplicationRepository(conn).OrgID(ctx, appID)
+		apps := db.NewApplicationRepository(conn)
+		orgID, err := apps.OrgID(ctx, appID)
 		if err != nil {
 			return mapDBError(err, "no application with this id in an organization you belong to", "")
 		}
@@ -216,6 +237,15 @@ func (s *Server) handleGetDeployments(w http.ResponseWriter, r *http.Request) {
 		if _, err := requireMembership(ctx, conn, userID, orgID); err != nil {
 			return err
 		}
+		// replicas_desired lives on the application, not any one deployment
+		// revision — every row in this list is compared against the
+		// application's *current* desired count (Task 7), same as the
+		// Deployment controller (Task 4) only ever reconciles the latest
+		// deployment against it.
+		app, err := apps.Get(ctx, appID)
+		if err != nil {
+			return mapDBError(err, "no application with this id in an organization you belong to", "")
+		}
 		deployments, err = db.NewDeploymentRepository(conn).ListByApplication(ctx, appID, limit, afterRevision)
 		if err != nil {
 			return err
@@ -225,7 +255,7 @@ func (s *Server) handleGetDeployments(w http.ResponseWriter, r *http.Request) {
 		data = make([]deploymentResponse, len(deployments))
 		for i, d := range deployments {
 			data[i] = toDeploymentResponse(d)
-			if err := attachPlacement(ctx, containers, d.ID, &data[i]); err != nil {
+			if err := attachReplicaState(ctx, containers, d.ID, app.ReplicasDesired, &data[i]); err != nil {
 				return err
 			}
 		}

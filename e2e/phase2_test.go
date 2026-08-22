@@ -51,7 +51,7 @@ func TestE2E_Phase2ExitCriteria(t *testing.T) {
 	containersBefore := dockerContainerIDs(t, "nginx:latest")
 	t.Cleanup(func() { removeNewContainers(t, "nginx:latest", containersBefore) })
 
-	dbURL := startPostgres(t, ctx)
+	_, dbURL := startPostgres(t, ctx)
 	natsURL := startNATS(t, ctx)
 
 	// Speed up the liveness sweep the final assertion waits on — Task 5's
@@ -243,20 +243,24 @@ func nodeTableRows(t *testing.T, out string) []nodeRow {
 	return rows
 }
 
-// deploymentNodeID extracts the NODE column from `platform get
-// deployments`'s single-revision row (this test only ever deploys once).
+// deploymentNodeID extracts the NODES column from `platform get
+// deployments`'s single-revision row (this test only ever deploys once, at
+// the default of 1 replica, so NODES is always exactly one id — Task 7,
+// phase-3-controllers.md, replaced the old singular NODE/CONTAINER_STATUS
+// columns with REPLICAS/NODES to support more than one container per
+// deployment).
 func deploymentNodeID(t *testing.T, out string) string {
 	t.Helper()
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) < 2 {
 		t.Fatalf("expected at least one deployment row in output:\n%s", out)
 	}
-	// REVISION STATUS IMAGE NODE CONTAINER_STATUS CREATED_AT
+	// REVISION STATUS IMAGE REPLICAS NODES CREATED_AT
 	fields := strings.Fields(lines[len(lines)-1])
-	if len(fields) < 4 {
+	if len(fields) < 5 {
 		t.Fatalf("malformed `get deployments` row %q in output:\n%s", lines[len(lines)-1], out)
 	}
-	nodeID := fields[3]
+	nodeID := fields[4]
 	if nodeID == "-" {
 		t.Fatalf("deployment has no node_id yet (placement hasn't landed) in output:\n%s", out)
 	}

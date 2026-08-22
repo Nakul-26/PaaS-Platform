@@ -25,6 +25,7 @@ POST   /v1/orgs/:orgId/projects
 GET    /v1/projects/:projectId/applications
 POST   /v1/projects/:projectId/applications
 GET    /v1/applications/:appId
+PATCH  /v1/applications/:appId                # scale: { replicas_desired } (phase-3-controllers.md Task 5)
 POST   /v1/applications/:appId/deployments
 GET    /v1/applications/:appId/deployments
 GET    /v1/deployments/:deploymentId

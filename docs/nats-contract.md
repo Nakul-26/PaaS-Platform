@@ -51,7 +51,7 @@ Consumed by: `scheduler` (updates `nodes.last_heartbeat_at`; a node is marked `u
 
 ### `placement.requested`
 
-Published by `apiserver` when a deployment needs scheduling — replaces Phase 1's direct HTTP call to the worker (`ARCHITECTURE.md` §2.1: the API server "does not talk to workers directly").
+Published by `apiserver` when a deployment needs scheduling — replaces Phase 1's direct HTTP call to the worker (`ARCHITECTURE.md` §2.1: the API server "does not talk to workers directly"). Also published by `controller-manager` (`phase-3-controllers.md` Task 4) once per missing replica whenever a deployment's actual running-container count falls below `applications.replicas_desired` — a crash-recovery or scale-up request looks identical to a deploy-time one; the scheduler can't tell them apart and doesn't need to.
 
 ```json
 {
@@ -85,7 +85,7 @@ Published by `scheduler` to the specific node it placed the work on, after writi
 
 ### `node.<id>.unassign`
 
-Published to the specific node a container actually runs on, to stop and remove that one container — the piece that lets anything (controller, apiserver) act on a container wherever it actually runs, instead of a hardcoded worker address (`phase-3-controllers.md` Task 2).
+Published to the specific node a container actually runs on, to stop and remove that one container — the piece that lets anything (controller, apiserver) act on a container wherever it actually runs, instead of a hardcoded worker address (`phase-3-controllers.md` Task 2). Published by `controller-manager` (Task 4) once per excess replica whenever a deployment's actual running-container count exceeds `applications.replicas_desired`, oldest-started-first.
 
 ```json
 {
