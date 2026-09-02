@@ -106,11 +106,12 @@ Published by a worker after acting on a `node.<id>.assign` message, and again on
   "container_id": "a1b2c3...",
   "status": "running",
   "exit_code": 0,
+  "ports": [{ "container_port": 80, "host_port": 32768, "protocol": "tcp" }],
   "timestamp": "2026-08-18T10:00:05Z"
 }
 ```
 
-`status` uses the same vocabulary as `containers.status` (`database-schema.md` §2): `pending`, `running`, `crashed`, `stopped`. Consumed by: `scheduler` (writes the observed status back onto the `containers` row).
+`status` uses the same vocabulary as `containers.status` (`database-schema.md` §2): `pending`, `running`, `crashed`, `stopped`. `ports` reports the runtime's actual assigned host port(s) — resolved even when the corresponding `node.<id>.assign` request's `host_port` was `0` (ephemeral) — and is omitted (not just zero) for states with no bound ports (e.g. `stopped`). Consumed by: `scheduler` (writes the observed status back onto the `containers` row); `ports` itself has no consumer yet — `phase-4-service-discovery-lb.md` Task 3's controller is the first to read it, to populate `service_instances.port`.
 
 ## Stream definitions
 

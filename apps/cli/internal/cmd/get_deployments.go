@@ -45,7 +45,7 @@ func newGetDeploymentsCmd() *cobra.Command {
 				return nil
 			}
 			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-			_, _ = fmt.Fprintln(tw, "REVISION\tSTATUS\tIMAGE\tREPLICAS\tNODES\tCREATED_AT")
+			_, _ = fmt.Fprintln(tw, "REVISION\tSTATUS\tIMAGE\tREPLICAS\tNODES\tSERVICE\tCREATED_AT")
 			for _, d := range page.Data {
 				nodes := "-"
 				if len(d.Containers) > 0 {
@@ -55,8 +55,17 @@ func newGetDeploymentsCmd() *cobra.Command {
 					}
 					nodes = strings.Join(ids, ",")
 				}
+				// "-" until Task 3's controller has lazily created a service
+				// for this application (its first-ever healthy instance) —
+				// send this value as the load balancer's X-Platform-Service
+				// header to actually reach it (phase-4-service-discovery-lb.md
+				// open decision 2).
+				service := "-"
+				if d.Service != nil {
+					service = d.Service.DNSName
+				}
 				replicas := fmt.Sprintf("%d/%d", d.ReplicasRunning, d.ReplicasDesired)
-				_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", d.Revision, d.Status, d.Image, replicas, nodes, d.CreatedAt.Format("2006-01-02T15:04:05Z"))
+				_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", d.Revision, d.Status, d.Image, replicas, nodes, service, d.CreatedAt.Format("2006-01-02T15:04:05Z"))
 			}
 			return tw.Flush()
 		},

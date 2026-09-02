@@ -255,12 +255,30 @@ func TestWorker_ProcessesAssignmentOverNATS(t *testing.T) {
 		_ = rt.RemoveContainer(context.Background(), containerID)
 	})
 
+	// phase-4-service-discovery-lb.md Task 2: the assignment requested
+	// host_port 0 (ephemeral); the status message must report the real
+	// assigned host port, not 0, without this test querying Docker itself.
+	ports, _ := status["ports"].([]any)
+	if len(ports) != 1 {
+		t.Fatalf("expected exactly one port binding in status message, got %+v", status)
+	}
+	portEntry, _ := ports[0].(map[string]any)
+	if hostPort, _ := portEntry["host_port"].(float64); hostPort == 0 {
+		t.Fatalf("expected a real (non-zero) host_port in status message, got %+v", portEntry)
+	}
+	if containerPort, _ := portEntry["container_port"].(float64); containerPort != 80 {
+		t.Fatalf("expected container_port 80 in status message, got %+v", portEntry)
+	}
+
 	info, err := rt.ContainerStatus(ctx, containerID)
 	if err != nil {
 		t.Fatalf("inspecting container %s on the real docker daemon: %v", containerID, err)
 	}
 	if info.Status != runtime.StatusRunning {
 		t.Fatalf("expected container %s to actually be running on the docker daemon, got status %q", containerID, info.Status)
+	}
+	if len(info.Ports) != 1 || info.Ports[0].HostPort == 0 {
+		t.Fatalf("expected ContainerStatus to also report the real assigned host port, got %+v", info.Ports)
 	}
 }
 

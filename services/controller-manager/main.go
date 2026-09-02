@@ -52,9 +52,34 @@ func main() {
 		ReconcileInterval: config.Duration("CONTROLLER_RECONCILE_INTERVAL", 5*time.Second),
 	}, logger)
 
+	svcCtrl := controller.NewServiceInstanceController(bus, db.NewServiceReconcileRepository(pool.Conn()), db.NewServiceRepository(pool.Conn()), db.NewServiceInstanceRepository(pool.Conn()), controller.ServiceInstanceConfig{
+		ReconcileInterval: config.Duration("CONTROLLER_SERVICE_RECONCILE_INTERVAL", 5*time.Second),
+	}, logger)
+
 	logger.Info("controller-manager: starting")
-	if err := ctrl.Run(ctx); err != nil {
-		logger.Error("controller-manager: run failed", "error", err)
+
+	// Both reconcile loops (ARCHITECTURE.md §2.3: one loop per resource
+	// type) run for this single instance's whole lifetime; if either
+	// returns an error, cancel ctx so the other winds down too before this
+	// process exits, rather than leaving it running orphaned.
+	type result struct {
+		name string
+		err  error
+	}
+	results := make(chan result, 2)
+	go func() { results <- result{"deployment", ctrl.Run(ctx)} }()
+	go func() { results <- result{"service-instance", svcCtrl.Run(ctx)} }()
+
+	failed := false
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err != nil {
+			logger.Error("controller-manager: run failed", "controller", r.name, "error", r.err)
+			failed = true
+			stop()
+		}
+	}
+	if failed {
 		os.Exit(1)
 	}
 	logger.Info("controller-manager: shutting down")

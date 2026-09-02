@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -464,6 +465,17 @@ func TestAPIServer_ScaleApplication(t *testing.T) {
 		}
 	}
 
+	// Task 3's Service Instance controller (phase-4-service-discovery-lb.md)
+	// runs inside this same controller-manager process and should have
+	// turned these 3 running containers into a service by now — confirm
+	// Task 6's read path surfaces it: the exact value `platform get
+	// deployments` shows and the load balancer's X-Platform-Service header
+	// expects.
+	dnsName := waitForServiceDNSName(t, ctx, client, ts, token, appID, deploymentID, 30*time.Second)
+	if !strings.HasSuffix(dnsName, ".internal") {
+		t.Fatalf("expected service dns_name to end in .internal, got %q", dnsName)
+	}
+
 	// --- scale 3 -> 1 ---
 	scaledDown := doJSON(t, ctx, client, http.MethodPatch, ts.URL+"/v1/applications/"+appID, token,
 		map[string]any{"replicas_desired": 1}, http.StatusOK)
@@ -520,6 +532,40 @@ func waitForReplicaCount(t *testing.T, ctx context.Context, client *http.Client,
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for replicas_running = %d on deployment %s, last seen: %+v", want, deploymentID, d)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+// waitForServiceDNSName polls GET .../deployments — Task 6's read path —
+// until the named deployment's service.dns_name is populated. Task 3's
+// controller creates the service lazily on the application's first healthy
+// instance, the same eventually-consistent shape waitForReplicaCount above
+// already polls for.
+func waitForServiceDNSName(t *testing.T, ctx context.Context, client *http.Client, ts *httptest.Server, token, appID string, deploymentID uuid.UUID, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		listResp := doJSON(t, ctx, client, http.MethodGet, ts.URL+"/v1/applications/"+appID+"/deployments", token, nil, http.StatusOK)
+		data, _ := listResp["data"].([]any)
+		var d map[string]any
+		for _, raw := range data {
+			row, _ := raw.(map[string]any)
+			if row["id"] == deploymentID.String() {
+				d = row
+				break
+			}
+		}
+		if d == nil {
+			t.Fatalf("deployment %s not found in listing: %+v", deploymentID, listResp)
+		}
+		if svc, ok := d["service"].(map[string]any); ok {
+			if dnsName, _ := svc["dns_name"].(string); dnsName != "" {
+				return dnsName
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for a service dns_name on deployment %s, last seen: %+v", deploymentID, d)
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
@@ -845,6 +891,7 @@ func startTestControllerManager(t *testing.T, ctx context.Context, adminDSN, nat
 		"DATABASE_URL="+adminDSN,
 		"CONTROLLER_NATS_URL="+natsURL,
 		"CONTROLLER_RECONCILE_INTERVAL=1s",
+		"CONTROLLER_SERVICE_RECONCILE_INTERVAL=1s",
 	)
 	var output bytes.Buffer
 	cmd.Stdout = &output

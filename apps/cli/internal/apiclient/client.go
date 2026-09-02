@@ -160,6 +160,16 @@ type ContainerSummary struct {
 	Status string `json:"status"`
 }
 
+// Service is an application's load-balancer routing identity
+// (phase-4-service-discovery-lb.md Task 6) — nil until Task 3's controller
+// has lazily created one (the application's first-ever healthy instance).
+// DNSName is the exact value to send as the load balancer's
+// X-Platform-Service routing header (open decision 2) — not a resolvable
+// hostname yet, that's Phase 5's job.
+type Service struct {
+	DNSName string `json:"dns_name"`
+}
+
 type Deployment struct {
 	ID                string             `json:"id"`
 	ApplicationID     string             `json:"application_id"`
@@ -171,6 +181,7 @@ type Deployment struct {
 	ReplicasDesired   int                `json:"replicas_desired"`
 	ReplicasRunning   int                `json:"replicas_running"`
 	Containers        []ContainerSummary `json:"containers,omitempty"`
+	Service           *Service           `json:"service,omitempty"`
 	CreatedAt         time.Time          `json:"created_at"`
 	CompletedAt       *time.Time         `json:"completed_at,omitempty"`
 }

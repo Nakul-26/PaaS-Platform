@@ -41,11 +41,12 @@ type unassignMessage struct {
 // (pending|running|exited|unknown), which is worker-agent-contract.md's HTTP
 // vocabulary instead. containerStatus below is the mapping between the two.
 type statusMessage struct {
-	AssignmentID string    `json:"assignment_id"`
-	ContainerID  string    `json:"container_id"`
-	Status       string    `json:"status"`
-	ExitCode     int       `json:"exit_code"`
-	Timestamp    time.Time `json:"timestamp"`
+	AssignmentID string        `json:"assignment_id"`
+	ContainerID  string        `json:"container_id"`
+	Status       string        `json:"status"`
+	ExitCode     int           `json:"exit_code"`
+	Ports        []portBinding `json:"ports,omitempty"`
+	Timestamp    time.Time     `json:"timestamp"`
 }
 
 // subscribeAssignments ensures the JetStream streams this worker needs
@@ -109,13 +110,13 @@ func (a *Agent) handleAssignment(ctx context.Context, data []byte) {
 	info, err := a.startAssignedContainer(ctx, msg)
 	if err != nil {
 		a.logger.Error("acting on assignment", "assignment_id", msg.AssignmentID, "image", msg.Image, "error", err)
-		a.publishStatus(ctx, msg.AssignmentID, "", "crashed", 0)
+		a.publishStatus(ctx, msg.AssignmentID, "", "crashed", 0, nil)
 		return
 	}
 
 	status := containerStatus(info)
 	a.logger.Info("assignment started", "assignment_id", msg.AssignmentID, "container_id", info.ID, "image", msg.Image)
-	a.publishStatus(ctx, msg.AssignmentID, info.ID, status, info.ExitCode)
+	a.publishStatus(ctx, msg.AssignmentID, info.ID, status, info.ExitCode, info.Ports)
 
 	a.mu.Lock()
 	a.tracked[msg.AssignmentID] = &trackedContainer{containerID: info.ID, lastStatus: status}
@@ -145,7 +146,7 @@ func (a *Agent) handleUnassign(ctx context.Context, data []byte) {
 	}
 
 	a.logger.Info("container unassigned", "assignment_id", msg.AssignmentID, "container_id", msg.ContainerID)
-	a.publishStatus(ctx, msg.AssignmentID, msg.ContainerID, "stopped", 0)
+	a.publishStatus(ctx, msg.AssignmentID, msg.ContainerID, "stopped", 0, nil)
 
 	a.mu.Lock()
 	delete(a.tracked, msg.AssignmentID)
@@ -180,7 +181,7 @@ func (a *Agent) checkTrackedContainers(ctx context.Context) {
 		}
 
 		a.logger.Info("tracked container status changed", "assignment_id", assignmentID, "container_id", tc.containerID, "from", tc.lastStatus, "to", status)
-		a.publishStatus(ctx, assignmentID, tc.containerID, status, info.ExitCode)
+		a.publishStatus(ctx, assignmentID, tc.containerID, status, info.ExitCode, info.Ports)
 
 		a.mu.Lock()
 		if current, ok := a.tracked[assignmentID]; ok {
@@ -223,12 +224,22 @@ func (a *Agent) startAssignedContainer(ctx context.Context, msg assignMessage) (
 	return info, nil
 }
 
-func (a *Agent) publishStatus(ctx context.Context, assignmentID, containerID, status string, exitCode int) {
+func (a *Agent) publishStatus(ctx context.Context, assignmentID, containerID, status string, exitCode int, ports []runtime.PortBinding) {
+	msgPorts := make([]portBinding, 0, len(ports))
+	for _, p := range ports {
+		msgPorts = append(msgPorts, portBinding{
+			ContainerPort: p.ContainerPort,
+			HostPort:      p.HostPort,
+			Protocol:      p.Protocol,
+		})
+	}
+
 	data, err := json.Marshal(statusMessage{
 		AssignmentID: assignmentID,
 		ContainerID:  containerID,
 		Status:       status,
 		ExitCode:     exitCode,
+		Ports:        msgPorts,
 		Timestamp:    time.Now().UTC(),
 	})
 	if err != nil {

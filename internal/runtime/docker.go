@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"strconv"
 	"time"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
@@ -150,7 +151,38 @@ func (d *DockerRuntime) ContainerStatus(ctx context.Context, containerID string)
 		Status:    status,
 		ExitCode:  exitCode,
 		StartedAt: startedAt,
+		Ports:     hostPortBindings(inspect.NetworkSettings),
 	}, nil
+}
+
+// hostPortBindings extracts the runtime-assigned host ports from an
+// inspect's NetworkSettings.Ports — the same field ContainerStatus already
+// fetches via ContainerInspect, so this requires no extra Docker API call
+// (phase-4-service-discovery-lb.md Task 2). A container port bound to
+// multiple host IPs (e.g. both an IPv4 and IPv6 wildcard) reports only its
+// first binding — they share the same host port in practice since it's
+// chosen once per container port, regardless of how many IPs it's bound on.
+func hostPortBindings(ns *container.NetworkSettings) []PortBinding {
+	if ns == nil {
+		return nil
+	}
+
+	var bindings []PortBinding
+	for port, hostBindings := range ns.Ports {
+		if len(hostBindings) == 0 {
+			continue
+		}
+		hostPort, err := strconv.Atoi(hostBindings[0].HostPort)
+		if err != nil {
+			continue
+		}
+		bindings = append(bindings, PortBinding{
+			ContainerPort: int(port.Num()),
+			HostPort:      hostPort,
+			Protocol:      string(port.Proto()),
+		})
+	}
+	return bindings
 }
 
 func (d *DockerRuntime) StreamLogs(ctx context.Context, containerID string, follow bool) (io.ReadCloser, error) {

@@ -42,6 +42,11 @@ type ContainerStatusInfo struct {
 	Status    Status
 	ExitCode  int
 	StartedAt time.Time
+	// Ports is the container's actual bound host ports, as assigned by the
+	// runtime — populated even when the corresponding ContainerSpec.Ports
+	// entry requested an ephemeral HostPort of 0 (phase-4-service-discovery-lb.md
+	// Task 2). Empty for a container with no started/no port-bound state.
+	Ports []PortBinding
 }
 
 // ContainerRuntime is the port through which the worker agent manages

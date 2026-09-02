@@ -24,6 +24,16 @@ type containerSummaryDTO struct {
 	Status string `json:"status"`
 }
 
+// serviceDTO surfaces an application's load-balancer routing identity
+// (phase-4-service-discovery-lb.md Task 6): not a resolvable hostname yet
+// (Phase 5's job — custom domains/DNS), but the exact value Task 4's load
+// balancer's X-Platform-Service routing header expects, so a caller with
+// this value and the load balancer's own address can actually reach a
+// healthy instance.
+type serviceDTO struct {
+	DNSName string `json:"dns_name"`
+}
+
 type deploymentResponse struct {
 	ID            string `json:"id"`
 	ApplicationID string `json:"application_id"`
@@ -44,8 +54,14 @@ type deploymentResponse struct {
 	ReplicasDesired int                   `json:"replicas_desired"`
 	ReplicasRunning int                   `json:"replicas_running"`
 	Containers      []containerSummaryDTO `json:"containers,omitempty"`
-	CreatedAt       time.Time             `json:"created_at"`
-	CompletedAt     *time.Time            `json:"completed_at,omitempty"`
+	// Service is nil until Task 3's controller has lazily created one for
+	// this application (on its first-ever healthy instance) — a freshly
+	// deployed application with no running replicas yet has none. Same
+	// application-level value repeated on every row, same precedent as
+	// ReplicasDesired above (attachReplicaState).
+	Service     *serviceDTO `json:"service,omitempty"`
+	CreatedAt   time.Time   `json:"created_at"`
+	CompletedAt *time.Time  `json:"completed_at,omitempty"`
 }
 
 func toDeploymentResponse(d db.Deployment) deploymentResponse {
@@ -251,6 +267,23 @@ func (s *Server) handleGetDeployments(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
+		// services carries no RLS (database-schema.md — cluster runtime
+		// state, not tenant-scoped, same as containers/nodes below), so this
+		// works over the same RLS-scoped connection the rest of this
+		// handler already uses, no bypass needed. ErrNotFound just means
+		// Task 3's controller hasn't lazily created one yet — not this
+		// request's error.
+		var service *serviceDTO
+		svc, err := db.NewServiceRepository(conn).GetByApplication(ctx, appID)
+		switch {
+		case err == nil:
+			service = &serviceDTO{DNSName: svc.DNSName}
+		case errors.Is(err, db.ErrNotFound):
+			// No service yet; service stays nil.
+		default:
+			return err
+		}
+
 		containers := db.NewContainerRepository(conn)
 		data = make([]deploymentResponse, len(deployments))
 		for i, d := range deployments {
@@ -258,6 +291,7 @@ func (s *Server) handleGetDeployments(w http.ResponseWriter, r *http.Request) {
 			if err := attachReplicaState(ctx, containers, d.ID, app.ReplicasDesired, &data[i]); err != nil {
 				return err
 			}
+			data[i].Service = service
 		}
 		return nil
 	})

@@ -36,6 +36,13 @@ func NodeStatusSubject(nodeID string) string {
 // (docs/nats-contract.md).
 const PlacementRequestedSubject = "placement.requested"
 
+// ServiceUpdatedSubject is published by controller-manager's Service
+// Instance controller whenever a service_instances row changes
+// (phase-4-service-discovery-lb.md Task 3). Core NATS, not JetStream —
+// ARCHITECTURE.md §2.6's own reasoning: an occasional missed event is
+// acceptable since Task 4's periodic full-Postgres-resync pairs with it.
+const ServiceUpdatedSubject = "service.updated"
+
 // Stream names and wildcard subject filters for the JetStream-backed
 // subjects (docs/nats-contract.md's transport table) — assignments and
 // status transitions are loss-unacceptable, unlike register/heartbeat above.

@@ -16,11 +16,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,6 +179,228 @@ func TestControllerManager_ReplacesCrashedContainer(t *testing.T) {
 	}
 	if info.Status != runtime.StatusRunning {
 		t.Fatalf("expected replacement container %s to actually be running on the docker daemon, got status %q", replacementRuntimeID, info.Status)
+	}
+}
+
+// TestControllerManager_CreatesAndRemovesServiceInstances covers Task 3's
+// acceptance (phase-4-service-discovery-lb.md): against a real Postgres, a
+// real NATS instance, a real scheduler, a real worker, and a real
+// controller-manager, deploy an application at 3 replicas via desired state
+// alone (no manual placement.requested), confirm 3 service_instances rows
+// appear healthy, then scale down to 2 and confirm the removed replica's
+// instance row disappears and a service.updated event fires.
+func TestControllerManager_CreatesAndRemovesServiceInstances(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	rt, err := runtime.NewDockerRuntime()
+	if err != nil {
+		t.Skipf("docker daemon not available, skipping: %v", err)
+	}
+	defer func() { _ = rt.Close() }()
+
+	adminDSN, appDSN, adminDB, pool := startTestPostgres(t, ctx)
+	defer func() { _ = adminDB.Close() }()
+
+	applicationID, deploymentID := seedApplicationWithReplicas(t, ctx, adminDB, 3)
+
+	natsContainer, err := nats.Run(ctx, "nats:2.11.7")
+	if err != nil {
+		t.Fatalf("starting nats container: %v", err)
+	}
+	t.Cleanup(func() { _ = natsContainer.Terminate(context.Background()) })
+
+	natsURL, err := natsContainer.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("nats connection string: %v", err)
+	}
+
+	bus, err := eventbus.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connecting eventbus: %v", err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+
+	registrations := make(chan map[string]any, 4)
+	regSub, err := bus.Subscribe("node.*.register", func(msg eventbus.Message) {
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Data, &payload); err == nil {
+			registrations <- payload
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribing to node.*.register: %v", err)
+	}
+	defer func() { _ = regSub.Unsubscribe() }()
+
+	updates := make(chan map[string]any, 32)
+	updSub, err := bus.Subscribe("service.updated", func(msg eventbus.Message) {
+		var payload map[string]any
+		if err := json.Unmarshal(msg.Data, &payload); err == nil {
+			updates <- payload
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribing to service.updated: %v", err)
+	}
+	defer func() { _ = updSub.Unsubscribe() }()
+
+	startTestScheduler(t, ctx, appDSN, natsURL)
+	startTestWorker(t, ctx, natsURL)
+	startTestControllerManager(t, ctx, adminDSN, natsURL)
+
+	var registration map[string]any
+	select {
+	case registration = <-registrations:
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for node registration message")
+	}
+	if nodeID, _ := registration["node_id"].(string); nodeID == "" {
+		t.Fatalf("registration message missing node_id: %+v", registration)
+	}
+
+	// The scheduler ensures PLACEMENT/NODE_ASSIGNMENTS on startup; this
+	// test's own EnsureStream is an idempotent no-op layered on top, same as
+	// this file's other tests.
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.PlacementStream,
+		Subjects: []string{eventbus.PlacementStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.PlacementStream, err)
+	}
+
+	containers := db.NewContainerRepository(pool.Conn())
+	services := db.NewServiceRepository(pool.Conn())
+	instances := db.NewServiceInstanceRepository(pool.Conn())
+
+	// No manual placement.requested publish: the Deployment controller's own
+	// reconcile tick (phase-3-controllers.md Task 4) sees actual(0) <
+	// desired(3) and requests placement on its own.
+	svc := waitForHealthyServiceInstances(t, ctx, services, instances, applicationID, 3, 90*time.Second)
+	if svc.ApplicationID != applicationID {
+		t.Fatalf("expected service for application %s, got %+v", applicationID, svc)
+	}
+	if !strings.HasSuffix(svc.DNSName, ".internal") {
+		t.Fatalf("expected dns_name to end in .internal, got %q", svc.DNSName)
+	}
+
+	running, err := containers.ListByDeployment(ctx, deploymentID)
+	if err != nil {
+		t.Fatalf("ListByDeployment: %v", err)
+	}
+	for _, c := range running {
+		if c.Status != db.ContainerStatusRunning || c.ContainerRuntimeID == nil {
+			continue
+		}
+		runtimeID := *c.ContainerRuntimeID
+		t.Cleanup(func() {
+			_ = rt.StopContainer(context.Background(), runtimeID, 5*time.Second)
+			_ = rt.RemoveContainer(context.Background(), runtimeID)
+		})
+	}
+
+	// Drain events already queued from the 3 creations so the post-scale-down
+	// wait below only has to notice a fresh one.
+drain:
+	for {
+		select {
+		case <-updates:
+		default:
+			break drain
+		}
+	}
+
+	// Scale down to 2 via the same desired-state path a real `platform
+	// scale` would use. The controller's existing scaleDown/unassign path
+	// (phase-3-controllers.md Task 4) picks which replica to remove; this
+	// test only asserts on the outcome, not which one, so drive desired
+	// state directly via SQL like this file's other seeding helpers do.
+	if _, err := adminDB.ExecContext(ctx, `UPDATE applications SET replicas_desired = 2 WHERE id = $1`, applicationID); err != nil {
+		t.Fatalf("scaling application down to 2 replicas: %v", err)
+	}
+
+	waitForHealthyServiceInstances(t, ctx, services, instances, applicationID, 2, 60*time.Second)
+
+	select {
+	case <-updates:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for a service.updated event after scaling down")
+	}
+}
+
+// seedApplicationWithReplicas inserts one organization/user/project/
+// application/deployment row (as the admin, bypassing RLS) with
+// replicas_desired set to replicas and a single exposed container port —
+// Task 3's acceptance needs more than the single steady-state replica
+// seedRunningDeployment already covers for Task 4's own test, and needs a
+// real exposed port so a real host port actually gets bound (Task 2)
+// for the Service Instance controller to observe. Mirrors
+// seedRunningDeployment (duplicated rather than parameterizing it, so that
+// test's own call site stays untouched, ADR-0012's "no service depends on
+// another's exact shape" reasoning applied to test helpers too).
+func seedApplicationWithReplicas(t *testing.T, ctx context.Context, adminDB *sql.DB, replicas int) (applicationID, deploymentID uuid.UUID) {
+	t.Helper()
+
+	var orgID, userID, projectID uuid.UUID
+	if err := adminDB.QueryRowContext(ctx,
+		`INSERT INTO organizations (name, slug) VALUES ('Org', 'org') RETURNING id`,
+	).Scan(&orgID); err != nil {
+		t.Fatalf("seeding organization: %v", err)
+	}
+	if err := adminDB.QueryRowContext(ctx,
+		`INSERT INTO users (email, password_hash) VALUES ('user@example.com', 'hash') RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatalf("seeding user: %v", err)
+	}
+	if err := adminDB.QueryRowContext(ctx,
+		`INSERT INTO projects (org_id, name, slug) VALUES ($1, 'Project', 'project') RETURNING id`, orgID,
+	).Scan(&projectID); err != nil {
+		t.Fatalf("seeding project: %v", err)
+	}
+	if err := adminDB.QueryRowContext(ctx,
+		`INSERT INTO applications (org_id, project_id, name, image, replicas_desired, ports)
+		 VALUES ($1, $2, 'app', 'nginx:latest', $3, '[{"container_port": 80}]'::jsonb) RETURNING id`,
+		orgID, projectID, replicas,
+	).Scan(&applicationID); err != nil {
+		t.Fatalf("seeding application: %v", err)
+	}
+	if err := adminDB.QueryRowContext(ctx,
+		`INSERT INTO deployments (org_id, application_id, image, revision, created_by) VALUES ($1, $2, 'nginx:latest', 1, $3) RETURNING id`,
+		orgID, applicationID, userID,
+	).Scan(&deploymentID); err != nil {
+		t.Fatalf("seeding deployment: %v", err)
+	}
+	return applicationID, deploymentID
+}
+
+// waitForHealthyServiceInstances polls until applicationID's service has
+// exactly want healthy instances, returning the service row once it does.
+func waitForHealthyServiceInstances(t *testing.T, ctx context.Context, services db.ServiceRepository, instances db.ServiceInstanceRepository, applicationID uuid.UUID, want int, timeout time.Duration) db.Service {
+	t.Helper()
+
+	deadline := time.After(timeout)
+	for {
+		svc, err := services.GetByApplication(ctx, applicationID)
+		switch {
+		case err == nil:
+			healthy, err := instances.ListHealthyByService(ctx, svc.ID)
+			if err != nil {
+				t.Fatalf("ListHealthyByService: %v", err)
+			}
+			if len(healthy) == want {
+				return svc
+			}
+		case errors.Is(err, db.ErrNotFound):
+			// Service not lazily created yet; keep polling.
+		default:
+			t.Fatalf("GetByApplication: %v", err)
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d healthy service instances for application %s", want, applicationID)
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 }
 
@@ -446,6 +670,7 @@ func startTestControllerManager(t *testing.T, ctx context.Context, adminDSN, nat
 		"DATABASE_URL="+adminDSN,
 		"CONTROLLER_NATS_URL="+natsURL,
 		"CONTROLLER_RECONCILE_INTERVAL=1s",
+		"CONTROLLER_SERVICE_RECONCILE_INTERVAL=1s",
 	)
 	var output bytes.Buffer
 	cmd.Stdout = &output

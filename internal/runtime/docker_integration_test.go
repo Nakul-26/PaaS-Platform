@@ -60,6 +60,16 @@ func TestDockerRuntime_Lifecycle(t *testing.T) {
 		t.Fatalf("expected container status %q, got %q", StatusRunning, status.Status)
 	}
 
+	// phase-4-service-discovery-lb.md Task 2: the container was created with
+	// host_port 0 (ephemeral); ContainerStatus must report the real assigned
+	// host port, not 0.
+	if len(status.Ports) != 1 {
+		t.Fatalf("expected exactly one port binding, got %v", status.Ports)
+	}
+	if got := status.Ports[0]; got.ContainerPort != 80 || got.HostPort == 0 || got.Protocol != "tcp" {
+		t.Fatalf("expected container_port 80 with a real (non-zero) host_port and tcp protocol, got %+v", got)
+	}
+
 	logs, err := rt.StreamLogs(ctx, containerID, false)
 	if err != nil {
 		t.Fatalf("StreamLogs: %v", err)

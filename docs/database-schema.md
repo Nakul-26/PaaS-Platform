@@ -108,7 +108,9 @@ Durable backing store for service discovery (`ARCHITECTURE.md` §2.6); the in-me
 - `last_seen_at` + a TTL check is what ages out instances whose heartbeats stopped arriving.
 
 ### `domains`
-- `id pk`, `project_id fk`, `hostname unique`, `application_id fk→applications`, `tls_status enum(pending|active|failed)`, `created_at`
+- `id pk`, `org_id fk` (denormalized per §3, added at implementation time — not in this doc's original sketch), `project_id fk`, `hostname unique`, `application_id fk→applications`, `tls_status enum(pending|active|failed)`, `created_at`
+- Index: `(application_id)` — the load balancer's resync join against `services.application_id` (`phase-5-networking-ingress.md` Task 4).
+- RLS: scoped to `org_id`, same two-branch policy shape §3 describes for `applications`.
 
 ### `resource_quotas`
 One row per org (not a history table).
