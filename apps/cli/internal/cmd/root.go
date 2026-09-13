@@ -35,8 +35,12 @@ func Execute() int {
 		newDeployCmd(),
 		newScaleCmd(),
 		newGetCmd(),
+		newUpdateCmd(),
 		newLogsCmd(),
 		newDeleteCmd(),
+		newInviteCmd(),
+		newRemoveMemberCmd(),
+		newSetRoleCmd(),
 	)
 
 	if err := root.Execute(); err != nil {

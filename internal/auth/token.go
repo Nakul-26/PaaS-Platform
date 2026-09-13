@@ -104,3 +104,58 @@ func HashRefreshToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
 }
+
+// apiKeyPrefix marks a bearer credential as an API key rather than a JWT
+// access token (api-conventions.md §3) — Authenticate branches on it.
+const apiKeyPrefix = "pk_live_"
+
+const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// GenerateAPIKey returns a new pk_live_-prefixed API key plaintext (handed
+// back to the caller exactly once, at creation — phase-6-multi-tenant-saas.md
+// Task 5) and its SHA-256 hash (the only thing ever stored, via
+// APIKeyRepository.Create) — same hash-not-plaintext discipline as
+// GenerateRefreshToken.
+func GenerateAPIKey() (key, hash string, err error) {
+	suffix, err := randomBase62(32)
+	if err != nil {
+		return "", "", fmt.Errorf("generating api key: %w", err)
+	}
+	key = apiKeyPrefix + suffix
+	return key, HashAPIKey(key), nil
+}
+
+// HashAPIKey hashes a caller-supplied API key for lookup against the stored
+// hash — never compare or store the plaintext (same reasoning as
+// HashRefreshToken: a generated key is already high-entropy, so a fast
+// cryptographic hash is the right primitive, not bcrypt).
+func HashAPIKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+// randomBase62 returns a cryptographically random base62 string of length n
+// (api-conventions.md §3 / phase-6-multi-tenant-saas.md Task 5's "32 random
+// bytes, base62"). Rejection sampling — discarding any byte that would bias
+// the result, rather than a plain `randomByte % 62` — avoids the slight
+// skew a naive modulo would introduce, since 256 isn't a multiple of 62.
+func randomBase62(n int) (string, error) {
+	const maxUnbiased = 62 * 4 // largest multiple of 62 that fits in a byte
+	out := make([]byte, 0, n)
+	buf := make([]byte, n)
+	for len(out) < n {
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		for _, b := range buf {
+			if b >= maxUnbiased {
+				continue
+			}
+			out = append(out, base62Alphabet[b%62])
+			if len(out) == n {
+				break
+			}
+		}
+	}
+	return string(out), nil
+}

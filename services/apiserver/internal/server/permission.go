@@ -20,6 +20,9 @@ import (
 // member" and "wrong role" is handled by the caller mapping the returned
 // error (db.ErrNotFound vs. this function's own forbidden sentinel).
 func requirePermission(ctx context.Context, conn db.Conn, userID, orgID uuid.UUID, perm auth.Permission) error {
+	if err := requireAPIKeyOrgMatch(ctx, orgID); err != nil {
+		return err
+	}
 	role, err := db.NewMembershipRepository(conn).RoleForUser(ctx, userID, orgID)
 	if err != nil {
 		return err
@@ -35,11 +38,34 @@ func requirePermission(ctx context.Context, conn db.Conn, userID, orgID uuid.UUI
 // (rbac-multitenancy.md §2: logs/metrics viewing is available to viewer
 // too, unlike every mutating action).
 func requireMembership(ctx context.Context, conn db.Conn, userID, orgID uuid.UUID) (auth.Role, error) {
+	if err := requireAPIKeyOrgMatch(ctx, orgID); err != nil {
+		return "", err
+	}
 	role, err := db.NewMembershipRepository(conn).RoleForUser(ctx, userID, orgID)
 	if err != nil {
 		return "", err
 	}
 	return auth.Role(role), nil
+}
+
+// requireAPIKeyOrgMatch enforces that an API-key-authenticated request
+// (auth.APIKeyOrgIDFromContext) never acts against an org other than the
+// one its key was created for. A JWT-authenticated request (no API-key org
+// in context) is unaffected — its access is governed purely by the
+// caller's real memberships, exactly as before. Without this, an API key
+// would be as powerful as its creator's full JWT across every org they
+// belong to, not just the one org it names
+// (phase-6-multi-tenant-saas.md Task 5). Returns an *apiError directly
+// (not a db sentinel) so this is correctly reported as 404 regardless of
+// whether a given call site wraps requirePermission/requireMembership's
+// result through mapDBError — an org-mismatched key must not learn
+// anything more about the target org than "this doesn't work"
+// (rbac-multitenancy.md §5).
+func requireAPIKeyOrgMatch(ctx context.Context, orgID uuid.UUID) error {
+	if keyOrgID, ok := auth.APIKeyOrgIDFromContext(ctx); ok && keyOrgID != orgID {
+		return errNotFound("no organization with this id that you belong to")
+	}
+	return nil
 }
 
 // requirePlatformAdmin gates GET /v1/nodes (phase-2-multi-node.md Task 6:

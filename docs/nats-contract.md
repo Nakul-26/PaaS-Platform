@@ -14,6 +14,8 @@ All payloads are JSON; timestamps are RFC 3339 UTC, matching `api-conventions.md
 | `node.<id>.assign` | JetStream (stream `NODE_ASSIGNMENTS`) | Same reasoning as above: a lost assignment means the scheduler *thinks* it placed work that never actually started. |
 | `node.<id>.unassign` | JetStream (stream `NODE_ASSIGNMENTS`) | Same reasoning as `node.<id>.assign`: a lost unassign leaves a container running that the control plane thinks is gone. |
 | `node.<id>.status` | JetStream (stream `NODE_STATUS`) | Status transitions (esp. `running` → `crashed`) are the state-change events ADR-0005 calls out by name; losing one hides a real failure from the control plane until the next reconcile. |
+| `build.requested` | JetStream (stream `BUILDS`) | A lost build request strands a `builds` row in `pending` forever with nothing to retry it — the same "unacceptable loss" case `placement.requested` already makes, one step earlier in the same chain (`phase-7-deployment-platform.md` Open Decision 1). |
+| `build.completed` | JetStream (stream `BUILDS`) | A lost completion leaves a build stuck in `pending` and, worse, silently drops the deployment that success was supposed to produce — the git-deploy path's entire payoff. |
 
 Every JetStream-backed read path here still needs the Postgres reconcile-fallback R7 requires — NATS being down must degrade placement/status visibility, not corrupt it. That fallback is each subject's consuming service's responsibility (scheduler for `NODE_STATUS`/`PLACEMENT`, worker for `NODE_ASSIGNMENTS`), not this contract's.
 
@@ -113,6 +115,43 @@ Published by a worker after acting on a `node.<id>.assign` message, and again on
 
 `status` uses the same vocabulary as `containers.status` (`database-schema.md` §2): `pending`, `running`, `crashed`, `stopped`. `ports` reports the runtime's actual assigned host port(s) — resolved even when the corresponding `node.<id>.assign` request's `host_port` was `0` (ephemeral) — and is omitted (not just zero) for states with no bound ports (e.g. `stopped`). Consumed by: `scheduler` (writes the observed status back onto the `containers` row); `ports` itself has no consumer yet — `phase-4-service-discovery-lb.md` Task 3's controller is the first to read it, to populate `service_instances.port`.
 
+### `build.requested`
+
+Published by `apiserver` when a deployment is requested from a Git repo URL instead of an already-pushed image (`phase-7-deployment-platform.md` Task 4), immediately after the `builds` row is created in `pending`.
+
+```json
+{
+  "build_id": "b3c1...",
+  "org_id": "0a9f...",
+  "application_id": "a1b2...",
+  "git_url": "https://github.com/example/app.git",
+  "git_ref": "main",
+  "image_repository": "localhost:5000/0a9f.../a1b2..."
+}
+```
+
+`image_repository` is the push target *without* a tag — `image-builder` appends `:<commit_sha>` itself, since the SHA isn't known until the clone resolves it (`phase-7-deployment-platform.md` Open Decision 3). `org_id` is carried purely so it can be echoed back on `build.completed`; `image-builder` never interprets it. Consumed by: `image-builder` (clone → docker build → push).
+
+### `build.completed`
+
+Published by `image-builder` once a build attempt reaches a terminal outcome — one subject for both success and failure, with a `status` field carrying the branch, mirroring `node.<id>.status`'s existing precedent rather than splitting into two subjects.
+
+```json
+{
+  "build_id": "b3c1...",
+  "org_id": "0a9f...",
+  "status": "succeeded",
+  "commit_sha": "9f2c1ab...",
+  "image": "localhost:5000/0a9f.../a1b2...:9f2c1ab"
+}
+```
+
+`status` is `succeeded` or `failed`. A success carries `commit_sha`/`image` and no `error`; a failure carries `error` and neither — every failure mode (bad ref, missing `Dockerfile`, build failure, push failure) is reported identically, and there is no partial-success case.
+
+`org_id` is echoed verbatim from the originating `build.requested`. It exists because `builds` carries RLS (`0014_builds.sql`) while a NATS message arrives with no session to scope by, so the consumer needs *some* org to open its transaction with. It is a **hint, not an authority**: every value actually acted on (`application_id`, `created_by`, and the org itself) is read back off the `builds` row, and a wrong or forged `org_id` simply makes RLS return no row for `build_id`, so the message fails closed rather than reaching another tenant's data.
+
+Consumed by: `apiserver` (records the outcome via `BuildRepository.UpdateResult`; on `succeeded`, additionally creates the `deployments` row and publishes `placement.requested` through the same shared helper the HTTP `--image` path uses — `phase-7-deployment-platform.md` Task 4/Open Decision 2).
+
 ## Stream definitions
 
 | Stream | Subjects | Retention |
@@ -120,6 +159,7 @@ Published by a worker after acting on a `node.<id>.assign` message, and again on
 | `PLACEMENT` | `placement.requested` | Limits (default JetStream retention — a request is consumed once by the single scheduler instance) |
 | `NODE_ASSIGNMENTS` | `node.*.assign`, `node.*.unassign` | Limits |
 | `NODE_STATUS` | `node.*.status` | Limits |
+| `BUILDS` | `build.requested`, `build.completed` | Limits (both directions of one build's lifecycle share a stream — `phase-7-deployment-platform.md` Open Decision 1) |
 
 Each service that publishes on a JetStream subject is responsible for calling `EventBus.EnsureStream` for it at startup (idempotent — `CreateOrUpdateStream`), so no separate provisioning step is required.
 

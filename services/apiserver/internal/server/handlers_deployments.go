@@ -94,8 +94,96 @@ func attachReplicaState(ctx context.Context, containers db.ContainerRepository, 
 	return nil
 }
 
+// deployRequest is POST /v1/applications/:appId/deployments' body. Image
+// and GitURL are the two mutually exclusive input modes
+// (phase-7-deployment-platform.md Task 4): an already-pushed image, or a
+// Git repo the platform builds into one itself. Neither being set is not
+// an error — that's the pre-existing "redeploy the application's current
+// image" path (see handleDeploy), which predates the git mode and stays
+// exactly as it was.
 type deployRequest struct {
-	Image string `json:"image,omitempty"`
+	Image  string `json:"image,omitempty"`
+	GitURL string `json:"git_url,omitempty"`
+	GitRef string `json:"git_ref,omitempty"`
+}
+
+// createDeploymentTx writes the desired state half of a deploy: bump the
+// application's image if this deploy changes it, create the deployments
+// row, and audit it. Extracted (phase-7-deployment-platform.md Task 4) so
+// the two paths that produce a deployment — the HTTP image path
+// (handleDeploy) and the build.completed consumer's succeeded branch
+// (handleBuildCompleted) — run one sequence rather than two hand-copied
+// ones. Runs inside the caller's transaction, alongside whatever quota
+// check that caller already did, so the check and the write stay atomic
+// (the TOCTOU gap Layer 1 exists to close). app is updated in place when
+// image differs from it, so the caller's later publishPlacement sees the
+// image actually deployed.
+func createDeploymentTx(ctx context.Context, conn db.Conn, orgID, appID, actorID uuid.UUID, app *db.Application, image string) (db.Deployment, error) {
+	if image != "" && image != app.Image {
+		if err := db.NewApplicationRepository(conn).UpdateImage(ctx, appID, image); err != nil {
+			return db.Deployment{}, err
+		}
+		app.Image = image
+	}
+
+	deployment, err := db.NewDeploymentRepository(conn).Create(ctx, orgID, appID, app.Image, actorID)
+	if err != nil {
+		return db.Deployment{}, mapDBError(err, "", "a deployment for this revision already exists")
+	}
+	if err := recordAudit(ctx, conn, orgID, actorID, "deployment.create", "deployment", deployment.ID, map[string]any{
+		"application_id": appID.String(), "image": deployment.Image, "revision": deployment.Revision,
+	}); err != nil {
+		return db.Deployment{}, err
+	}
+	return deployment, nil
+}
+
+// publishPlacement publishes placement.requested for a just-created
+// deployment — the other half of createDeploymentTx, and the other half
+// shared by both deploy paths.
+//
+// Publishing is a network call outside any DB transaction (ADR-0012 —
+// never held across a cross-service call). A publish failure is a real,
+// terminal failure of this deploy attempt (nothing will ever place it), so
+// it's the one case that gets written back via UpdateResult; a successful
+// publish leaves the row exactly as Create left it ('pending') — the
+// scheduler and worker don't report back onto deployments at all, only
+// onto containers (docs/nats-contract.md), so attachReplicaState's join
+// through containers is the actual source of live placement status from
+// here on, not this row.
+func (s *Server) publishPlacement(ctx context.Context, orgID, actorID uuid.UUID, app db.Application, deployment db.Deployment) error {
+	ports := make([]portBinding, len(app.Ports))
+	for i, p := range app.Ports {
+		ports[i] = portBinding{ContainerPort: p.ContainerPort, HostPort: p.HostPort, Protocol: p.Protocol}
+	}
+	msgData, err := json.Marshal(placementRequestedMessage{
+		DeploymentID:  deployment.ID.String(),
+		ApplicationID: app.ID.String(),
+		Image:         deployment.Image,
+		Ports:         ports,
+	})
+	if err != nil {
+		s.logger.Error("marshaling placement.requested", "deployment_id", deployment.ID, "error", err)
+		return fmt.Errorf("marshaling placement request: %w", err)
+	}
+
+	var publishErr error
+	if s.bus == nil {
+		publishErr = errors.New("event bus not connected")
+	} else {
+		publishErr = s.bus.PublishDurable(ctx, eventbus.PlacementRequestedSubject, msgData)
+	}
+	if publishErr == nil {
+		return nil
+	}
+
+	s.logger.Error("publishing placement.requested", "deployment_id", deployment.ID, "error", publishErr)
+	if updateErr := s.pool.WithTx(ctx, actorID, orgID, func(ctx context.Context, conn db.Conn) error {
+		return db.NewDeploymentRepository(conn).UpdateResult(ctx, deployment.ID, db.DeploymentStatusFailed, nil)
+	}); updateErr != nil {
+		s.logger.Error("recording deployment result", "deployment_id", deployment.ID, "error", updateErr)
+	}
+	return publishErr
 }
 
 // handleDeploy is POST /v1/applications/:appId/deployments. As of Task 6
@@ -116,9 +204,22 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	var req deployRequest
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			s.writeError(w, r, errBadRequest("request body must be valid JSON with an optional image"))
+			s.writeError(w, r, errBadRequest("request body must be valid JSON with an optional image or git_url"))
 			return
 		}
+	}
+
+	// The two input modes are mutually exclusive (Task 4): asking the
+	// platform to build an image *and* naming one to deploy has no coherent
+	// meaning. Setting neither is not rejected — it's the pre-existing
+	// redeploy-current-image path this route has always had.
+	if req.Image != "" && req.GitURL != "" {
+		s.writeError(w, r, errBadRequest("image and git_url are mutually exclusive — pass one or neither"))
+		return
+	}
+	if req.GitURL != "" {
+		s.handleGitDeploy(w, r, appID, userID, req)
+		return
 	}
 
 	ctx := r.Context()
@@ -146,62 +247,30 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 			return mapDBError(err, "no application with this id in an organization you belong to", "")
 		}
 
-		image := app.Image
-		if req.Image != "" && req.Image != app.Image {
-			image = req.Image
-			if err := apps.UpdateImage(ctx, appID, image); err != nil {
-				return err
-			}
-			app.Image = image
+		// Layer 1 of the three-layer quota scheme
+		// (phase-6-multi-tenant-saas.md Task 6) — see quota.go's own doc
+		// comment. A deploy alone never changes replicas_desired, so
+		// checkResourceQuota's meaningful check here is containers (a
+		// first-ever deploy is what actually brings an application's
+		// containers into existence); its CPU/memory arm is a defensive
+		// no-op re-check today (see that function's own doc comment).
+		if err := checkDeploymentQuota(ctx, conn, orgID); err != nil {
+			return err
+		}
+		if err := checkResourceQuota(ctx, conn, orgID, app, app.ReplicasDesired); err != nil {
+			return err
 		}
 
-		deployment, err = db.NewDeploymentRepository(conn).Create(ctx, orgID, appID, image, userID)
-		return mapDBError(err, "", "a deployment for this revision already exists")
+		deployment, err = createDeploymentTx(ctx, conn, orgID, appID, userID, &app, req.Image)
+		return err
 	})
 	if err != nil {
 		s.writeError(w, r, err)
 		return
 	}
 
-	// Publishing is a network call outside any DB transaction (ADR-0012 —
-	// never held across a cross-service call). A publish failure is a real,
-	// terminal failure of this deploy attempt (nothing will ever place it),
-	// so it's the one case that gets written back via UpdateResult; a
-	// successful publish leaves the row exactly as Create left it
-	// ('pending') — the scheduler and worker don't report back onto
-	// deployments at all, only onto containers (docs/nats-contract.md), so
-	// attachReplicaState's join through containers is the actual source of
-	// live placement status from here on, not this row.
-	ports := make([]portBinding, len(app.Ports))
-	for i, p := range app.Ports {
-		ports[i] = portBinding{ContainerPort: p.ContainerPort, HostPort: p.HostPort, Protocol: p.Protocol}
-	}
-	msgData, err := json.Marshal(placementRequestedMessage{
-		DeploymentID:  deployment.ID.String(),
-		ApplicationID: appID.String(),
-		Image:         deployment.Image,
-		Ports:         ports,
-	})
-	if err != nil {
-		s.logger.Error("marshaling placement.requested", "deployment_id", deployment.ID, "error", err)
-		s.writeError(w, r, fmt.Errorf("marshaling placement request: %w", err))
-		return
-	}
-
-	var publishErr error
-	if s.bus == nil {
-		publishErr = errors.New("event bus not connected")
-	} else {
-		publishErr = s.bus.PublishDurable(ctx, eventbus.PlacementRequestedSubject, msgData)
-	}
-	if publishErr != nil {
-		s.logger.Error("publishing placement.requested", "deployment_id", deployment.ID, "error", publishErr)
-		if updateErr := s.pool.WithTx(ctx, userID, orgID, func(ctx context.Context, conn db.Conn) error {
-			return db.NewDeploymentRepository(conn).UpdateResult(ctx, deployment.ID, db.DeploymentStatusFailed, nil)
-		}); updateErr != nil {
-			s.logger.Error("recording deployment result", "deployment_id", deployment.ID, "error", updateErr)
-		}
-		s.writeError(w, r, &apiError{http.StatusBadGateway, "deploy_failed", fmt.Sprintf("failed to publish placement request: %v", publishErr)})
+	if err := s.publishPlacement(ctx, orgID, userID, app, deployment); err != nil {
+		s.writeError(w, r, &apiError{http.StatusBadGateway, "deploy_failed", fmt.Sprintf("failed to publish placement request: %v", err)})
 		return
 	}
 

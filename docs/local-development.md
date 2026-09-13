@@ -20,6 +20,8 @@ apiserver             # REST API, port 8080
 scheduler             # Phase 2+
 controller-manager    # Phase 3+
 loadbalancer          # Phase 4+
+image-builder         # Phase 7+
+registry              # local, unauthenticated image registry — Phase 7+
 worker-1, worker-2, worker-3   # logical nodes, shared host Docker daemon (ADR-0009)
 ```
 

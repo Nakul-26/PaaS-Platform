@@ -57,3 +57,26 @@ const (
 	PlacementStream       = "PLACEMENT"
 	PlacementStreamFilter = "placement.requested"
 )
+
+// BuildRequestedSubject is published by apiserver when an application is
+// deployed from a Git repo URL instead of an already-pushed image
+// (phase-7-deployment-platform.md Task 3/4, docs/nats-contract.md).
+// BuildCompletedSubject is published by image-builder once a build
+// attempt reaches a terminal outcome — one subject for both success and
+// failure (payload carries a status field), mirroring node.<id>.status's
+// existing "one subject, a status field carries the branch" precedent
+// rather than splitting into two subjects. Both are JetStream-backed on
+// one BUILDS stream: a lost build.requested strands a deploy attempt with
+// nothing to retry it, and a lost build.completed leaves a build stuck in
+// 'pending' forever — the same "unacceptable loss" reasoning
+// placement.requested/node.<id>.status already establish.
+const (
+	BuildRequestedSubject = "build.requested"
+	BuildCompletedSubject = "build.completed"
+
+	BuildsStream = "BUILDS"
+)
+
+// BuildsStreamSubjects is BuildsStream's subject list, passed to
+// EnsureStream.
+var BuildsStreamSubjects = []string{BuildRequestedSubject, BuildCompletedSubject}

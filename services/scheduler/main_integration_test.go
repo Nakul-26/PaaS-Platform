@@ -42,7 +42,7 @@ func TestScheduler_PlacesDeploymentOnHealthyWorker(t *testing.T) {
 	}
 	defer func() { _ = rt.Close() }()
 
-	dbURL, adminDB, pool := startTestPostgres(t, ctx)
+	dbURL, adminDBURL, adminDB, pool := startTestPostgres(t, ctx)
 	defer func() { _ = adminDB.Close() }()
 
 	deploymentID := seedDeployment(t, ctx, adminDB)
@@ -76,7 +76,7 @@ func TestScheduler_PlacesDeploymentOnHealthyWorker(t *testing.T) {
 	}
 	defer func() { _ = regSub.Unsubscribe() }()
 
-	startTestScheduler(t, ctx, dbURL, natsURL)
+	startTestScheduler(t, ctx, dbURL, adminDBURL, natsURL)
 	startTestWorker(t, ctx, natsURL)
 	startTestWorker(t, ctx, natsURL)
 
@@ -176,11 +176,130 @@ func TestScheduler_PlacesDeploymentOnHealthyWorker(t *testing.T) {
 	}
 }
 
-// startTestPostgres starts a real Postgres container, applies migrations
-// 0001-0007, and returns the app-role connection string (for the
-// subprocesses under test), an admin *sql.DB (for seeding), and an
-// app-role *db.Pool (for reading back scheduler results).
-func startTestPostgres(t *testing.T, ctx context.Context) (string, *sql.DB, *db.Pool) {
+// TestScheduler_RejectsPlacementOverQuota is Layer 2's (scheduler)
+// acceptance test for Task 6 (phase-6-multi-tenant-saas.md,
+// ARCHITECTURE.md §2.9): a placement.requested event that would push an
+// org over its MaxContainers ceiling is rejected — no second containers
+// row written — even though nothing upstream ever checked quota first
+// (there is no API server anywhere in this test), exactly the "closes the
+// TOCTOU gap a stale Layer 1 check could slip past" scenario the phase doc
+// describes. No worker or Docker daemon is needed: this only asserts what
+// gets written to Postgres, never that a container actually starts.
+func TestScheduler_RejectsPlacementOverQuota(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	dbURL, adminDBURL, adminDB, pool := startTestPostgres(t, ctx)
+	defer func() { _ = adminDB.Close() }()
+
+	deploymentID := seedDeployment(t, ctx, adminDB)
+	var orgID uuid.UUID
+	if err := adminDB.QueryRowContext(ctx, `SELECT org_id FROM deployments WHERE id = $1`, deploymentID).Scan(&orgID); err != nil {
+		t.Fatalf("resolving seeded deployment's org: %v", err)
+	}
+	// seedDeployment already inserted a generous quota row — lower just
+	// max_containers here rather than inserting a second (conflicting) row.
+	if _, err := adminDB.ExecContext(ctx,
+		`UPDATE resource_quotas SET max_containers = 1 WHERE org_id = $1`, orgID,
+	); err != nil {
+		t.Fatalf("lowering org quota (max_containers=1): %v", err)
+	}
+
+	var nodeID uuid.UUID
+	if err := adminDB.QueryRowContext(ctx,
+		`INSERT INTO nodes (hostname, ip, cpu_capacity_millicores, memory_capacity_mb) VALUES ('node-1', '10.0.0.1', 4000, 8192) RETURNING id`,
+	).Scan(&nodeID); err != nil {
+		t.Fatalf("seeding node: %v", err)
+	}
+	// Already at the org's ceiling before the scheduler ever sees a
+	// placement.requested event — the real "stale Layer 1 check" scenario:
+	// something already used up the org's one container slot.
+	if _, err := adminDB.ExecContext(ctx,
+		`INSERT INTO containers (deployment_id, node_id, status) VALUES ($1, $2, 'running')`, deploymentID, nodeID,
+	); err != nil {
+		t.Fatalf("seeding an already-at-quota container: %v", err)
+	}
+
+	natsContainer, err := nats.Run(ctx, "nats:2.11.7")
+	if err != nil {
+		t.Fatalf("starting nats container: %v", err)
+	}
+	t.Cleanup(func() { _ = natsContainer.Terminate(context.Background()) })
+
+	natsURL, err := natsContainer.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("nats connection string: %v", err)
+	}
+
+	bus, err := eventbus.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connecting eventbus: %v", err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+
+	startTestScheduler(t, ctx, dbURL, adminDBURL, natsURL)
+
+	// The scheduler ensures PLACEMENT on startup (subscribePlacement); this
+	// test's own EnsureStream is an idempotent no-op layered on top, same
+	// as the sibling test's identical comment.
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.PlacementStream,
+		Subjects: []string{eventbus.PlacementStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.PlacementStream, err)
+	}
+
+	// A second placement.requested for the *same* deployment — the
+	// Deployment controller asking for one more replica, exactly the
+	// request that would carry the org from 1 to 2 containers.
+	placementData, err := json.Marshal(map[string]any{
+		"deployment_id":  deploymentID.String(),
+		"application_id": uuid.New().String(),
+		"image":          "nginx:latest",
+	})
+	if err != nil {
+		t.Fatalf("marshaling placement.requested message: %v", err)
+	}
+	if err := bus.PublishDurable(ctx, eventbus.PlacementRequestedSubject, placementData); err != nil {
+		t.Fatalf("publishing placement.requested: %v", err)
+	}
+
+	containers := db.NewContainerRepository(pool.Conn())
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			// No container ever appeared for the whole wait — the quota
+			// check held. This is the test's success path: proving an
+			// absence needs a real wait, not a single immediate check.
+			rows, err := containers.ListByDeployment(ctx, deploymentID)
+			if err != nil {
+				t.Fatalf("final ListByDeployment: %v", err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("expected exactly the 1 pre-seeded container for the deployment, got %d: %+v", len(rows), rows)
+			}
+			return
+		case <-time.After(200 * time.Millisecond):
+			rows, err := containers.ListByDeployment(ctx, deploymentID)
+			if err != nil {
+				t.Fatalf("ListByDeployment: %v", err)
+			}
+			if len(rows) > 1 {
+				t.Fatalf("expected the over-quota placement to be rejected, but a 2nd container was written: %+v", rows)
+			}
+		}
+	}
+}
+
+// startTestPostgres starts a real Postgres container, applies every
+// migration, and returns the app-role connection string (for the
+// subprocesses under test), the raw superuser connection string (Layer 2's
+// quota check needs an RLS-bypass connection — phase-6-multi-tenant-saas.md
+// Task 6, same reasoning db.ReconcileRepository's doc comment gives), an
+// admin *sql.DB (for seeding), and an app-role *db.Pool (for reading back
+// scheduler results).
+func startTestPostgres(t *testing.T, ctx context.Context) (string, string, *sql.DB, *db.Pool) {
 	t.Helper()
 
 	container, err := postgres.Run(ctx, "postgres:16-alpine",
@@ -233,7 +352,7 @@ func startTestPostgres(t *testing.T, ctx context.Context) (string, *sql.DB, *db.
 	}
 	t.Cleanup(pool.Close)
 
-	return appConnStr, adminDB, pool
+	return appConnStr, adminConnStr, adminDB, pool
 }
 
 // seedDeployment inserts one organization/user/project/application/deployment
@@ -241,7 +360,12 @@ func startTestPostgres(t *testing.T, ctx context.Context) (string, *sql.DB, *db.
 // real deployment_id to point at. Mirrors internal/db's own
 // node_container_integration_test.go seedDeployment — duplicated here
 // rather than imported, since that helper lives in an unexported _test.go
-// file in a different package.
+// file in a different package. Also seeds a generous resource_quotas row
+// (phase-6-multi-tenant-saas.md Task 6): a real org always gets one
+// atomically at signup (handleSignup), and Layer 2's checkQuota
+// (placement.go) now depends on that invariant holding for every org it
+// resolves — without one here, every placement in this file would be
+// rejected as quota_exceeded (missing row, not an actual ceiling).
 func seedDeployment(t *testing.T, ctx context.Context, adminDB *sql.DB) uuid.UUID {
 	t.Helper()
 
@@ -250,6 +374,12 @@ func seedDeployment(t *testing.T, ctx context.Context, adminDB *sql.DB) uuid.UUI
 		`INSERT INTO organizations (name, slug) VALUES ('Org', 'org') RETURNING id`,
 	).Scan(&orgID); err != nil {
 		t.Fatalf("seeding organization: %v", err)
+	}
+	if _, err := adminDB.ExecContext(ctx,
+		`INSERT INTO resource_quotas (org_id, max_cpu_millicores, max_memory_mb, max_containers, max_projects, max_deployments_per_day)
+		 VALUES ($1, 8000, 16384, 20, 10, 100)`, orgID,
+	); err != nil {
+		t.Fatalf("seeding resource quota: %v", err)
 	}
 	if err := adminDB.QueryRowContext(ctx,
 		`INSERT INTO users (email, password_hash) VALUES ('user@example.com', 'hash') RETURNING id`,
@@ -277,9 +407,12 @@ func seedDeployment(t *testing.T, ctx context.Context, adminDB *sql.DB) uuid.UUI
 }
 
 // startTestScheduler builds and runs the real scheduler binary as a
-// separate OS process (ADR-0012), pointed at dbURL/natsURL with fast
-// liveness-sweep settings.
-func startTestScheduler(t *testing.T, ctx context.Context, dbURL, natsURL string) {
+// separate OS process (ADR-0012), pointed at dbURL/adminDBURL/natsURL with
+// fast liveness-sweep settings. adminDBURL backs Layer 2's quota check
+// (phase-6-multi-tenant-saas.md Task 6) — the same superuser connection
+// startTestPostgres already opens for seeding, reused here rather than
+// standing up a second role.
+func startTestScheduler(t *testing.T, ctx context.Context, dbURL, adminDBURL, natsURL string) {
 	t.Helper()
 
 	goBin, err := goBinary()
@@ -301,8 +434,14 @@ func startTestScheduler(t *testing.T, ctx context.Context, dbURL, natsURL string
 	cmd := exec.CommandContext(ctx, binPath)
 	cmd.Env = append(os.Environ(),
 		"APP_DATABASE_URL="+dbURL,
+		"SCHEDULER_ADMIN_DATABASE_URL="+adminDBURL,
 		"SCHEDULER_NATS_URL="+natsURL,
-		"SCHEDULER_HEARTBEAT_TIMEOUT=5s",
+		// Generous relative to any test's own runtime — Task 6's quota test
+		// below seeds a node's last_heartbeat_at once, directly via SQL,
+		// with no real worker refreshing it afterward; a short timeout here
+		// risked the liveness sweep marking it unreachable mid-test for
+		// reasons having nothing to do with what that test actually checks.
+		"SCHEDULER_HEARTBEAT_TIMEOUT=60s",
 		"SCHEDULER_LIVENESS_SWEEP_INTERVAL=1s",
 	)
 	var output bytes.Buffer

@@ -33,6 +33,25 @@ func main() {
 	}
 	defer pool.Close()
 
+	// A second, superuser connection for Layer 2 of the three-layer quota
+	// scheme (phase-6-multi-tenant-saas.md Task 6): resource_quotas and
+	// deployments both carry RLS (ADR-0010), and the scheduler has no
+	// per-request tenant session to key app.current_org_id/current_user_id
+	// off — its placement loop is inherently cross-tenant, every org's
+	// deployments, same reasoning db.ReconcileRepository's and
+	// db.DomainRoutingRepository's own doc comments already give for
+	// controller-manager/loadbalancer's identical dual-connection split
+	// (see loadbalancer's main.go for the precedent this mirrors). nodes/
+	// containers stay on the ordinary platform_app pool above — those two
+	// tables carry no RLS at all, so there's no need to widen their access.
+	adminDBURL := config.String("SCHEDULER_ADMIN_DATABASE_URL", "postgres://platform:platform@localhost:5432/platform?sslmode=disable")
+	adminPool, err := db.Open(ctx, adminDBURL)
+	if err != nil {
+		logger.Error("connecting to postgres as admin", "error", err)
+		os.Exit(1)
+	}
+	defer adminPool.Close()
+
 	bus := connectEventBus(ctx, logger)
 	if bus == nil {
 		logger.Error("scheduler: giving up connecting to nats, cannot function without it")
@@ -40,10 +59,11 @@ func main() {
 	}
 	defer func() { _ = bus.Close() }()
 
-	sched := scheduler.New(bus, db.NewNodeRepository(pool.Conn()), db.NewContainerRepository(pool.Conn()), scheduler.Config{
-		HeartbeatTimeout:      config.Duration("SCHEDULER_HEARTBEAT_TIMEOUT", 15*time.Second),
-		LivenessSweepInterval: config.Duration("SCHEDULER_LIVENESS_SWEEP_INTERVAL", 5*time.Second),
-	}, logger)
+	sched := scheduler.New(bus, db.NewNodeRepository(pool.Conn()), db.NewContainerRepository(pool.Conn()),
+		db.NewDeploymentRepository(adminPool.Conn()), db.NewQuotaRepository(adminPool.Conn()), scheduler.Config{
+			HeartbeatTimeout:      config.Duration("SCHEDULER_HEARTBEAT_TIMEOUT", 15*time.Second),
+			LivenessSweepInterval: config.Duration("SCHEDULER_LIVENESS_SWEEP_INTERVAL", 5*time.Second),
+		}, logger)
 
 	logger.Info("scheduler: starting")
 	if err := sched.Run(ctx); err != nil {

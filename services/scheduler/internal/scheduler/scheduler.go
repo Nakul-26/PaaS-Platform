@@ -26,18 +26,25 @@ type Config struct {
 // Scheduler owns the node-registry and placement loops for the single
 // Phase 2 scheduler instance.
 type Scheduler struct {
-	bus        eventbus.EventBus
-	nodes      db.NodeRepository
-	containers db.ContainerRepository
-	cfg        Config
-	logger     *slog.Logger
+	bus         eventbus.EventBus
+	nodes       db.NodeRepository
+	containers  db.ContainerRepository
+	deployments db.DeploymentRepository
+	quotas      db.QuotaRepository
+	cfg         Config
+	logger      *slog.Logger
 }
 
-func New(bus eventbus.EventBus, nodes db.NodeRepository, containers db.ContainerRepository, cfg Config, logger *slog.Logger) *Scheduler {
+// New wires the scheduler's dependencies. deployments/quotas back Layer 2
+// of the three-layer quota scheme (ARCHITECTURE.md §2.9,
+// phase-6-multi-tenant-saas.md Task 6) — see placement.go's checkQuota for
+// why they must be built over an RLS-bypass connection distinct from
+// nodes/containers' own (main.go's own doc comment explains the split).
+func New(bus eventbus.EventBus, nodes db.NodeRepository, containers db.ContainerRepository, deployments db.DeploymentRepository, quotas db.QuotaRepository, cfg Config, logger *slog.Logger) *Scheduler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Scheduler{bus: bus, nodes: nodes, containers: containers, cfg: cfg, logger: logger}
+	return &Scheduler{bus: bus, nodes: nodes, containers: containers, deployments: deployments, quotas: quotas, cfg: cfg, logger: logger}
 }
 
 // Run subscribes the node registry (register/heartbeat) and placement

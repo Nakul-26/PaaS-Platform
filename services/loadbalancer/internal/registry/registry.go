@@ -47,6 +47,14 @@ type Registry struct {
 	// failed) or an active health check probe failure, cleared by
 	// MarkHealthy (a subsequent successful probe). Absence means healthy.
 	unhealthyUntil map[uuid.UUID]time.Time
+	// hostRoutes maps a registered hostname (domains.hostname) to the
+	// dns_name it should route to (phase-5-networking-ingress.md Task 4) —
+	// a separate lookup from byDNS, refreshed only by the same periodic
+	// resync ticker that refreshes byDNS (open decision 2: domain
+	// registration is infrequent/administrative, so no push event on top
+	// of it — unlike byDNS, which also gets incremental Upsert/Remove from
+	// service.updated).
+	hostRoutes map[string]string
 }
 
 func New(strat strategy.BalancingStrategy) *Registry {
@@ -55,6 +63,7 @@ func New(strat strategy.BalancingStrategy) *Registry {
 		strategy:       strat,
 		lastSeen:       make(map[uuid.UUID]time.Time),
 		unhealthyUntil: make(map[uuid.UUID]time.Time),
+		hostRoutes:     make(map[string]string),
 	}
 }
 
@@ -85,6 +94,28 @@ func (r *Registry) ReplaceAll(byDNS map[string][]Instance) {
 			delete(r.unhealthyUntil, id)
 		}
 	}
+}
+
+// ReplaceHostRoutes swaps the entire hostname -> dns_name routing table
+// atomically — the periodic full-resync path, same posture as ReplaceAll.
+// routes should be built fresh from
+// db.DomainRoutingRepository.ListRoutes each time, never mutated
+// incrementally, so a domain deleted in Postgres since the last resync is
+// also absent here.
+func (r *Registry) ReplaceHostRoutes(routes map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hostRoutes = routes
+}
+
+// ResolveHost looks up the dns_name a registered hostname routes to.
+// ok=false means host isn't a currently registered domain — proxy.ServeHTTP
+// falls back to the X-Platform-Service header in that case.
+func (r *Registry) ResolveHost(host string) (dnsName string, ok bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	dnsName, ok = r.hostRoutes[host]
+	return dnsName, ok
 }
 
 // Upsert adds inst under dnsName, or refreshes its ip/port in place if an

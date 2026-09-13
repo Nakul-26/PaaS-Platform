@@ -12,6 +12,36 @@ func TestHasPermission_Matrix(t *testing.T) {
 		allowed map[Role]bool
 	}{
 		{
+			perm: PermOrganizationManage,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: false, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermOrganizationDelete,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: false, RoleDeveloper: false, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermMembersInvite,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: false, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermMembersRemove,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: false, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermMembersChangeRole,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: false, RoleViewer: false,
+			},
+		},
+		{
 			perm: PermProjectCreate,
 			allowed: map[Role]bool{
 				RoleOwner: true, RoleAdmin: true, RoleDeveloper: true, RoleViewer: false,
@@ -42,9 +72,63 @@ func TestHasPermission_Matrix(t *testing.T) {
 			},
 		},
 		{
+			perm: PermApplicationScale,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: true, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermDeploymentRollback,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: true, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermEnvVarsWrite,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: true, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermDomainsManage,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: true, RoleViewer: false,
+			},
+		},
+		{
 			perm: PermLogsView,
 			allowed: map[Role]bool{
 				RoleOwner: true, RoleAdmin: true, RoleDeveloper: true, RoleViewer: true,
+			},
+		},
+		{
+			perm: PermMetricsView,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: true, RoleViewer: true,
+			},
+		},
+		{
+			perm: PermAuditLogsView,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: false, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermAPIKeysCreate,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: false, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermAPIKeysRevoke,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: false, RoleViewer: false,
+			},
+		},
+		{
+			perm: PermBillingView,
+			allowed: map[Role]bool{
+				RoleOwner: true, RoleAdmin: true, RoleDeveloper: false, RoleViewer: false,
 			},
 		},
 	}

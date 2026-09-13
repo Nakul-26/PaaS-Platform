@@ -78,14 +78,32 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
+		// resource_quotas is RLS-bound (unlike organizations itself) —
+		// setting app.current_org_id here satisfies its two-branch policy's
+		// first branch directly, rather than relying on insert ordering
+		// against the membership row below (phase-6-multi-tenant-saas.md
+		// Task 1).
+		if err := db.SetCurrentOrg(ctx, conn, org.ID); err != nil {
+			return err
+		}
+		if _, err := db.NewQuotaRepository(conn).Create(ctx, org.ID, db.DefaultResourceQuota); err != nil {
+			return err
+		}
+
 		// The memberships RLS policy's "own membership" branch needs
 		// app.current_user_id set to the row being inserted — see
 		// db.SetCurrentUser's doc comment.
 		if err := db.SetCurrentUser(ctx, conn, user.ID); err != nil {
 			return err
 		}
-		_, err = db.NewMembershipRepository(conn).Create(ctx, org.ID, user.ID, db.MembershipRoleOwner)
-		return err
+		if _, err := db.NewMembershipRepository(conn).Create(ctx, org.ID, user.ID, db.MembershipRoleOwner); err != nil {
+			return err
+		}
+		// Task 7 (phase-6-multi-tenant-saas.md): the org didn't exist a
+		// moment ago, so this is the one audit-log write with no prior
+		// membership to check a permission against — every other mutating
+		// route requires one first.
+		return recordAudit(ctx, conn, org.ID, user.ID, "organization.create", "organization", org.ID, nil)
 	})
 	if err != nil {
 		s.writeError(w, r, err)

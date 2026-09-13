@@ -56,12 +56,26 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 
 	var project db.Project
 	err = s.pool.WithTx(r.Context(), userID, orgID, func(ctx context.Context, conn db.Conn) error {
+		// mapDBError here (not a bare `return err`, phase-6-multi-tenant-saas.md
+		// Task 3 finding): a non-member's db.ErrNotFound must become this
+		// package's 404, not fall through to writeError's 500 default — the
+		// same fix applied to the new org routes with the identical
+		// org-in-URL, no-resolution-step shape.
 		if err := requirePermission(ctx, conn, userID, orgID, auth.PermProjectCreate); err != nil {
+			return mapDBError(err, "no organization with this id that you belong to", "")
+		}
+		// Layer 1 of the three-layer quota scheme
+		// (phase-6-multi-tenant-saas.md Task 6) — see quota.go's own doc
+		// comment.
+		if err := checkProjectQuota(ctx, conn, orgID); err != nil {
 			return err
 		}
 		var err error
 		project, err = db.NewProjectRepository(conn).Create(ctx, orgID, req.Name, slug)
-		return mapDBError(err, "", "a project with this slug already exists in this organization")
+		if err != nil {
+			return mapDBError(err, "", "a project with this slug already exists in this organization")
+		}
+		return recordAudit(ctx, conn, orgID, userID, "project.create", "project", project.ID, map[string]any{"name": project.Name, "slug": project.Slug})
 	})
 	if err != nil {
 		s.writeError(w, r, err)

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -105,6 +106,90 @@ func (c *Client) auth(ctx context.Context, path, email, password string) (AuthRe
 	var resp AuthResponse
 	err := c.raw(ctx, http.MethodPost, path, body, false, &resp)
 	return resp, err
+}
+
+// Organization mirrors handlers_organizations.go's organizationResponse
+// (phase-6-multi-tenant-saas.md Task 3) — distinct from the Org type above
+// (AuthResponse's compact signup/login shape) since this one also carries
+// Name/CreatedAt for `platform get org`/`update org` to show.
+type Organization struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Slug      string    `json:"slug"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// GetOrganization calls GET /v1/orgs/:orgId.
+func (c *Client) GetOrganization(ctx context.Context, orgID string) (Organization, error) {
+	var o Organization
+	err := c.do(ctx, http.MethodGet, "/v1/orgs/"+orgID, nil, &o)
+	return o, err
+}
+
+// UpdateOrganization calls PATCH /v1/orgs/:orgId {name}. There is
+// deliberately no DeleteOrganization here yet — Task 3's open decision 2:
+// the DELETE route exists and is tested, but a CLI surface for deleting the
+// only org a session is authenticated against needs its own
+// "what happens next" story first.
+func (c *Client) UpdateOrganization(ctx context.Context, orgID, name string) (Organization, error) {
+	body, _ := json.Marshal(struct {
+		Name string `json:"name"`
+	}{name})
+	var o Organization
+	err := c.do(ctx, http.MethodPatch, "/v1/orgs/"+orgID, body, &o)
+	return o, err
+}
+
+// Membership mirrors handlers_members.go's membershipResponse
+// (phase-6-multi-tenant-saas.md Task 4).
+type Membership struct {
+	ID        string    `json:"id"`
+	OrgID     string    `json:"org_id"`
+	UserID    string    `json:"user_id"`
+	Email     string    `json:"email,omitempty"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type MembershipPage struct {
+	Data []Membership `json:"data"`
+}
+
+// ListMembers calls GET /v1/orgs/:orgId/members. What comes back depends on
+// the caller's own role — see MembershipRepository.ListByOrg's doc comment
+// server-side; an owner/admin session sees the full roster, any other role
+// sees only its own membership row.
+func (c *Client) ListMembers(ctx context.Context, orgID string) (MembershipPage, error) {
+	var page MembershipPage
+	err := c.do(ctx, http.MethodGet, "/v1/orgs/"+orgID+"/members", nil, &page)
+	return page, err
+}
+
+// InviteMember calls POST /v1/orgs/:orgId/members {email, role} — only
+// works for an already-registered user (open decision 3).
+func (c *Client) InviteMember(ctx context.Context, orgID, email, role string) (Membership, error) {
+	body, _ := json.Marshal(struct {
+		Email string `json:"email"`
+		Role  string `json:"role"`
+	}{email, role})
+	var m Membership
+	err := c.do(ctx, http.MethodPost, "/v1/orgs/"+orgID+"/members", body, &m)
+	return m, err
+}
+
+// ChangeMemberRole calls PATCH /v1/orgs/:orgId/members/:userId {role}.
+func (c *Client) ChangeMemberRole(ctx context.Context, orgID, userID, role string) (Membership, error) {
+	body, _ := json.Marshal(struct {
+		Role string `json:"role"`
+	}{role})
+	var m Membership
+	err := c.do(ctx, http.MethodPatch, "/v1/orgs/"+orgID+"/members/"+userID, body, &m)
+	return m, err
+}
+
+// RemoveMember calls DELETE /v1/orgs/:orgId/members/:userId.
+func (c *Client) RemoveMember(ctx context.Context, orgID, userID string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/orgs/"+orgID+"/members/"+userID, nil, nil)
 }
 
 type Project struct {
@@ -245,6 +330,142 @@ type NodePage struct {
 func (c *Client) ListNodes(ctx context.Context) (NodePage, error) {
 	var page NodePage
 	err := c.do(ctx, http.MethodGet, "/v1/nodes", nil, &page)
+	return page, err
+}
+
+// Domain mirrors handlers_domains.go's domainResponse
+// (phase-5-networking-ingress.md Task 2).
+type Domain struct {
+	ID            string    `json:"id"`
+	OrgID         string    `json:"org_id"`
+	ProjectID     string    `json:"project_id"`
+	ApplicationID string    `json:"application_id"`
+	Hostname      string    `json:"hostname"`
+	TLSStatus     string    `json:"tls_status"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+type DomainPage struct {
+	Data []Domain `json:"data"`
+}
+
+// CreateDomain registers hostname under projectID, routing to applicationID
+// once the load balancer's Host-header routing picks it up (Task 4).
+func (c *Client) CreateDomain(ctx context.Context, projectID, hostname, applicationID string) (Domain, error) {
+	body, _ := json.Marshal(struct {
+		Hostname      string `json:"hostname"`
+		ApplicationID string `json:"application_id"`
+	}{hostname, applicationID})
+	var d Domain
+	err := c.do(ctx, http.MethodPost, "/v1/projects/"+projectID+"/domains", body, &d)
+	return d, err
+}
+
+func (c *Client) ListDomains(ctx context.Context, projectID string) (DomainPage, error) {
+	var page DomainPage
+	err := c.do(ctx, http.MethodGet, "/v1/projects/"+projectID+"/domains", nil, &page)
+	return page, err
+}
+
+func (c *Client) DeleteDomain(ctx context.Context, domainID string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/domains/"+domainID, nil, nil)
+}
+
+// APIKey mirrors handlers_api_keys.go's apiKeyResponse
+// (phase-6-multi-tenant-saas.md Task 5). Key is only ever populated on the
+// response to CreateAPIKey — the plaintext is shown exactly once, at
+// creation, and never retrievable again.
+type APIKey struct {
+	ID        string     `json:"id"`
+	OrgID     string     `json:"org_id"`
+	Name      string     `json:"name"`
+	Scopes    []string   `json:"scopes"`
+	CreatedBy string     `json:"created_by"`
+	CreatedAt time.Time  `json:"created_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	Key       string     `json:"key,omitempty"`
+}
+
+type APIKeyPage struct {
+	Data []APIKey `json:"data"`
+}
+
+// CreateAPIKey calls POST /v1/orgs/:orgId/api-keys {name, scopes}.
+func (c *Client) CreateAPIKey(ctx context.Context, orgID, name string, scopes []string) (APIKey, error) {
+	body, _ := json.Marshal(struct {
+		Name   string   `json:"name"`
+		Scopes []string `json:"scopes,omitempty"`
+	}{name, scopes})
+	var k APIKey
+	err := c.do(ctx, http.MethodPost, "/v1/orgs/"+orgID+"/api-keys", body, &k)
+	return k, err
+}
+
+// ListAPIKeys calls GET /v1/orgs/:orgId/api-keys. Only owner/admin sessions
+// can call this successfully — api_keys.create gates both routes
+// (handleListAPIKeys's own doc comment).
+func (c *Client) ListAPIKeys(ctx context.Context, orgID string) (APIKeyPage, error) {
+	var page APIKeyPage
+	err := c.do(ctx, http.MethodGet, "/v1/orgs/"+orgID+"/api-keys", nil, &page)
+	return page, err
+}
+
+// DeleteAPIKey calls DELETE /v1/api-keys/:keyId.
+func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/api-keys/"+keyID, nil, nil)
+}
+
+// Quota mirrors handlers_quota.go's quotaResponse
+// (phase-6-multi-tenant-saas.md Task 6): an org's ceilings paired with its
+// live usage against each one.
+type Quota struct {
+	OrgID                string `json:"org_id"`
+	MaxCPUMillicores     int    `json:"max_cpu_millicores"`
+	MaxMemoryMB          int    `json:"max_memory_mb"`
+	MaxContainers        int    `json:"max_containers"`
+	MaxProjects          int    `json:"max_projects"`
+	MaxDeploymentsPerDay int    `json:"max_deployments_per_day"`
+	UsedCPUMillicores    int    `json:"used_cpu_millicores"`
+	UsedMemoryMB         int    `json:"used_memory_mb"`
+	UsedContainers       int    `json:"used_containers"`
+	UsedProjects         int    `json:"used_projects"`
+	UsedDeploymentsToday int    `json:"used_deployments_today"`
+}
+
+// GetQuota calls GET /v1/orgs/:orgId/quota.
+func (c *Client) GetQuota(ctx context.Context, orgID string) (Quota, error) {
+	var q Quota
+	err := c.do(ctx, http.MethodGet, "/v1/orgs/"+orgID+"/quota", nil, &q)
+	return q, err
+}
+
+// AuditLogEntry mirrors handlers_audit_logs.go's auditLogResponse
+// (phase-6-multi-tenant-saas.md Task 7).
+type AuditLogEntry struct {
+	ID          string          `json:"id"`
+	OrgID       string          `json:"org_id"`
+	ActorUserID *string         `json:"actor_user_id,omitempty"`
+	Action      string          `json:"action"`
+	TargetType  string          `json:"target_type"`
+	TargetID    string          `json:"target_id"`
+	Metadata    json.RawMessage `json:"metadata"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
+type AuditLogPage struct {
+	Data       []AuditLogEntry `json:"data"`
+	NextCursor *string         `json:"next_cursor"`
+}
+
+// ListAuditLogs calls GET /v1/orgs/:orgId/audit-logs?cursor=, newest first.
+// cursor is empty for the first page, or a previous call's NextCursor.
+func (c *Client) ListAuditLogs(ctx context.Context, orgID, cursor string) (AuditLogPage, error) {
+	path := "/v1/orgs/" + orgID + "/audit-logs"
+	if cursor != "" {
+		path += "?cursor=" + url.QueryEscape(cursor)
+	}
+	var page AuditLogPage
+	err := c.do(ctx, http.MethodGet, path, nil, &page)
 	return page, err
 }
 

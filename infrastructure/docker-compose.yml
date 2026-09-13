@@ -26,6 +26,16 @@ services:
     # wait on the client port being reachable instead (as the eventbus
     # integration test does via testcontainers' wait.ForListeningPort).
 
+  # registry: local, unauthenticated image registry image-builder (Phase 7)
+  # pushes built images to and workers pull them back from — same
+  # local-dev-is-a-logical-simulation posture ADR-0009 already established
+  # for worker node capacity, so Phase 7 doesn't need a real Docker
+  # Hub/ECR account. See phase-7-deployment-platform.md Task 2.
+  registry:
+    image: registry:2
+    ports:
+      - "${REGISTRY_PORT:-5000}:5000"
+
   # worker-1/2/3: three logical worker nodes per ADR-0009 — separate
   # processes, each with its own artificial capacity ceiling, all pointed at
   # this one host's real Docker daemon via the mounted socket (not isolated

@@ -198,6 +198,13 @@ loop:
   2. Scheduler re-checks quota at placement time (closes TOCTOU gap between API write and actual scheduling)
   3. Postgres CHECK constraints / triggers as last-resort backstop
 
+### 2.10 Image Builder **[INSTANCE: Go process + Docker Engine SDK]** *(Phase 7)*
+- Consumes "build requested" work items naming a Git repo URL/ref and a target application — not called directly by the API server (ADR-0012); the two communicate only over the published NATS contract, same posture as scheduler/worker
+- Clones the repo (public only in Phase 7 — see `docs/phases/phase-7-deployment-platform.md` Open Decision 4), builds an image from a `Dockerfile` at its root via the Docker Engine API, pushes it to a container registry
+- Reports outcome (success + resulting image reference, or failure + reason) back over NATS; the API server turns a success into an ordinary deployment, reusing the exact same desired-state-write-then-`placement.requested` path an already-pushed `--image` deploy uses — image-builder itself never talks to the scheduler or writes `deployments` rows
+- Abstracted behind an `ImageBuilder` interface from day one, same `ContainerRuntime`-style reasoning as §2.4/§8: Docker build is the first implementation, Buildpacks/Nixpacks/Kaniko are documented future alternatives (`docs/modularity-and-extensibility.md`)
+- Needs Docker-daemon access to build, like workers do to run (§6/ADR-0009's "not isolated hosts" local-dev posture) — but this is the first component that executes tenant-*supplied* build steps, not just tenant-*selected* images, a materially wider trust boundary flagged in the phase's own task plan and explicitly deferred, not solved, until a dedicated hardening pass
+
 ---
 
 ## 3. Communication Between Components

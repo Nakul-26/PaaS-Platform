@@ -116,6 +116,21 @@ func (s *Scheduler) handlePlacement(ctx context.Context, data []byte) {
 		return
 	}
 
+	// Layer 2 of the three-layer quota scheme (ARCHITECTURE.md §2.9,
+	// phase-6-multi-tenant-saas.md Task 6): re-verify quota at placement
+	// time, the same moment selectNode just confirmed capacity — closes the
+	// TOCTOU gap between the API server's own Layer 1 check and this
+	// commit (two concurrent scale/deploy requests can both pass Layer 1
+	// before either's placement actually lands). Rejected the same way an
+	// unschedulable-for-capacity assignment already is above: logged, no
+	// container row written, no assignment published — the deployment
+	// stays in whatever state it was already in, same as "no node
+	// available."
+	if err := s.checkQuota(ctx, deploymentID); err != nil {
+		s.logger.Warn("placement rejected: organization quota exceeded", "deployment_id", msg.DeploymentID, "error", err)
+		return
+	}
+
 	container, err := s.containers.Create(ctx, deploymentID, node.ID)
 	if err != nil {
 		s.logger.Error("recording placement decision", "deployment_id", msg.DeploymentID, "node_id", node.ID, "error", err)
@@ -179,6 +194,39 @@ func (s *Scheduler) handleStatus(ctx context.Context, data []byte) {
 		}
 		s.logger.Error("recording container status", "assignment_id", msg.AssignmentID, "error", err)
 	}
+}
+
+// checkQuota resolves deploymentID's owning org (over the scheduler's
+// admin/bypass connection — s.deployments/s.quotas have no RLS session to
+// key off, same reasoning db.ReconcileRepository's doc comment already
+// gives) and rejects if placing one more container would push the org's
+// container count over its ceiling, or if it's already over its CPU/memory
+// ceiling (checked, though always inert today — see
+// services/apiserver/internal/server/quota.go's identical caveat on
+// cpu_millicores/memory_mb never being set past zero by any route yet).
+func (s *Scheduler) checkQuota(ctx context.Context, deploymentID uuid.UUID) error {
+	orgID, err := s.deployments.OrgID(ctx, deploymentID)
+	if err != nil {
+		return fmt.Errorf("resolving deployment org for quota check: %w", err)
+	}
+	quota, err := s.quotas.Get(ctx, orgID)
+	if err != nil {
+		return fmt.Errorf("fetching quota for org %s: %w", orgID, err)
+	}
+	usage, err := s.quotas.CurrentUsage(ctx, orgID)
+	if err != nil {
+		return fmt.Errorf("computing usage for org %s: %w", orgID, err)
+	}
+
+	switch {
+	case usage.Containers+1 > quota.MaxContainers:
+		return fmt.Errorf("would exceed max containers for org %s (%d/%d)", orgID, usage.Containers+1, quota.MaxContainers)
+	case usage.CPUMillicores > quota.MaxCPUMillicores:
+		return fmt.Errorf("org %s already exceeds max cpu millicores (%d/%d)", orgID, usage.CPUMillicores, quota.MaxCPUMillicores)
+	case usage.MemoryMB > quota.MaxMemoryMB:
+		return fmt.Errorf("org %s already exceeds max memory mb (%d/%d)", orgID, usage.MemoryMB, quota.MaxMemoryMB)
+	}
+	return nil
 }
 
 // selectNode implements ARCHITECTURE.md §2.2's filter-then-score MVP

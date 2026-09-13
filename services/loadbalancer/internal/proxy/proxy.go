@@ -6,6 +6,7 @@ package proxy
 
 import (
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -15,10 +16,12 @@ import (
 	"platform/services/loadbalancer/internal/registry"
 )
 
-// ServiceHeader is the routing key this phase's requests are matched on
-// (phase-4-service-discovery-lb.md's open decision 2). Real hostname/path
-// routing is Phase 5's job (custom domains, TLS termination); until then,
-// callers name the target service directly by its services.dns_name.
+// ServiceHeader is Phase 4's routing key (open decision 2), still
+// consulted as a fallback now that real hostname routing exists (Task 4,
+// phase-5-networking-ingress.md): a request whose Host isn't a registered
+// domain gets one more chance via this header before ServeHTTP gives up
+// with 404 — keeping Phase 4's own integration tests, and this internal
+// testing path, working unchanged.
 const ServiceHeader = "X-Platform-Service"
 
 // Handler is the load balancer's http.Handler.
@@ -41,9 +44,9 @@ func New(reg *registry.Registry, ejectionWindow time.Duration, logger *slog.Logg
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	dnsName := r.Header.Get(ServiceHeader)
-	if dnsName == "" {
-		http.Error(w, ServiceHeader+" header is required", http.StatusBadRequest)
+	dnsName, ok := h.resolveDNSName(r)
+	if !ok {
+		http.Error(w, "no route registered for this host, and no "+ServiceHeader+" header", http.StatusNotFound)
 		return
 	}
 
@@ -61,4 +64,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 	rp.ServeHTTP(w, r)
+}
+
+// resolveDNSName matches primarily on r.Host (port suffix stripped, per
+// Task 4): a registered domain wins if there is one. Otherwise it falls
+// back to the ServiceHeader, exactly Phase 4's only routing mechanism.
+// ok=false means neither matched.
+func (h *Handler) resolveDNSName(r *http.Request) (string, bool) {
+	host := r.Host
+	if stripped, _, err := net.SplitHostPort(host); err == nil {
+		host = stripped
+	}
+	if dnsName, ok := h.registry.ResolveHost(host); ok {
+		return dnsName, true
+	}
+	if header := r.Header.Get(ServiceHeader); header != "" {
+		return header, true
+	}
+	return "", false
 }

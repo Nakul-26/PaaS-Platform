@@ -76,10 +76,23 @@ func main() {
 		defer func() { _ = bus.Close() }()
 	}
 
+	srv := server.New(pool, issuer, worker, bus, logger).
+		WithImageRegistry(config.String("IMAGE_REGISTRY_ADDR", "localhost:5000"))
+
+	// The build.completed consumer (phase-7-deployment-platform.md Task 4) —
+	// apiserver's first NATS subscription, not just publishes. A failure
+	// here degrades exactly like an unreachable bus already does: the
+	// git-deploy path stops working, every other route keeps serving.
+	if sub, err := srv.SubscribeBuilds(ctx); err != nil {
+		logger.Error("apiserver: subscribing to build.completed, git-based deploys will not complete until restart", "error", err)
+	} else if sub != nil {
+		defer func() { _ = sub.Unsubscribe() }()
+	}
+
 	addr := config.String("APISERVER_LISTEN_ADDR", ":8080")
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           server.New(pool, issuer, worker, bus, logger).Routes(),
+		Handler:           srv.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

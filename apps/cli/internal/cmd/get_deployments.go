@@ -18,6 +18,12 @@ func newGetCmd() *cobra.Command {
 	}
 	c.AddCommand(newGetDeploymentsCmd())
 	c.AddCommand(newGetNodesCmd())
+	c.AddCommand(newGetDomainsCmd())
+	c.AddCommand(newGetOrgCmd())
+	c.AddCommand(newGetMembersCmd())
+	c.AddCommand(newGetAPIKeysCmd())
+	c.AddCommand(newGetQuotaCmd())
+	c.AddCommand(newGetAuditLogCmd())
 	return c
 }
 

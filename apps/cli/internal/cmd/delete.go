@@ -6,6 +6,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// newDeleteCmd is `platform delete <app-name>` — kept as the flat, no-
+// subcommand-required form Phase 1 shipped (ARCHITECTURE.md's exit-
+// criteria script, e2e/phase1_test.go onward, all invoke it exactly this
+// way). Phase 5 Task 3 added `delete domain <hostname>` as a child command
+// rather than restructuring this one: cobra dispatches to a subcommand
+// only when args[0] matches its name, so `platform delete demo` still
+// falls through unchanged to this RunE as long as no application is ever
+// named "domain".
 func newDeleteCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "delete <app-name>",
@@ -32,5 +40,7 @@ func newDeleteCmd() *cobra.Command {
 			return nil
 		},
 	}
+	c.AddCommand(newDeleteDomainCmd())
+	c.AddCommand(newDeleteAPIKeyCmd())
 	return c
 }

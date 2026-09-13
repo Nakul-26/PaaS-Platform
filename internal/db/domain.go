@@ -10,6 +10,17 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// DomainTLSStatus mirrors the domain_tls_status Postgres enum
+// (0009_domains.sql), same ContainerStatus-style typed-string convention
+// container.go uses.
+type DomainTLSStatus string
+
+const (
+	DomainTLSStatusPending DomainTLSStatus = "pending"
+	DomainTLSStatusActive  DomainTLSStatus = "active"
+	DomainTLSStatusFailed  DomainTLSStatus = "failed"
+)
+
 // Domain maps a tenant-registered hostname onto one of their applications
 // (phase-5-networking-ingress.md Task 1, database-schema.md's `domains`
 // entry) — the load balancer's real, external routing key, as opposed to
@@ -20,7 +31,7 @@ type Domain struct {
 	ProjectID     uuid.UUID
 	ApplicationID uuid.UUID
 	Hostname      string
-	TLSStatus     string
+	TLSStatus     DomainTLSStatus
 	CreatedAt     time.Time
 }
 
@@ -36,6 +47,13 @@ type DomainRepository interface {
 	// OrgID resolves id's owning org, RLS-scoped only by
 	// app.current_user_id — see ProjectRepository.OrgID for why.
 	OrgID(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
+	// UpdateTLSStatus is used exactly once today: the API handler
+	// (handleCreateDomain) calls it right after Create to flip a freshly
+	// created domain straight to 'active' (phase-5-networking-ingress.md
+	// Task 2, open decision 3) — Create itself still defaults to 'pending'
+	// (the schema's general-purpose default), since that decision belongs
+	// to the API handler, not this repository.
+	UpdateTLSStatus(ctx context.Context, id uuid.UUID, status DomainTLSStatus) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
@@ -97,6 +115,17 @@ func (r *domainRepository) OrgID(ctx context.Context, id uuid.UUID) (uuid.UUID, 
 		return uuid.Nil, fmt.Errorf("resolving domain org: %w", err)
 	}
 	return orgID, nil
+}
+
+func (r *domainRepository) UpdateTLSStatus(ctx context.Context, id uuid.UUID, status DomainTLSStatus) error {
+	tag, err := r.conn.Exec(ctx, `UPDATE domains SET tls_status = $1 WHERE id = $2`, status, id)
+	if err != nil {
+		return fmt.Errorf("updating domain tls_status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (r *domainRepository) Delete(ctx context.Context, id uuid.UUID) error {

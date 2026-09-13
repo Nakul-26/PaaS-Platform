@@ -47,7 +47,7 @@ func TestE2E_Phase3ExitCriteria(t *testing.T) {
 	adminDBURL, dbURL := startPostgres(t, ctx)
 	natsURL := startNATS(t, ctx)
 
-	startScheduler(t, ctx, goBin, binDir, dbURL, natsURL)
+	startScheduler(t, ctx, goBin, binDir, adminDBURL, dbURL, natsURL)
 
 	workerBinPath := filepath.Join(binDir, "worker"+exeSuffix())
 	buildBinary(t, ctx, goBin, workerBinPath, "platform/services/worker")

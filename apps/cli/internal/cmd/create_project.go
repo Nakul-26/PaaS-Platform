@@ -15,6 +15,8 @@ func newCreateCmd() *cobra.Command {
 		Short: "Create a resource",
 	}
 	c.AddCommand(newCreateProjectCmd())
+	c.AddCommand(newCreateDomainCmd())
+	c.AddCommand(newCreateAPIKeyCmd())
 	return c
 }
 

@@ -51,6 +51,14 @@ type DeploymentRepository interface {
 	// Latest returns the most recent deployment for an application, or
 	// ErrNotFound if it has never been deployed.
 	Latest(ctx context.Context, applicationID uuid.UUID) (Deployment, error)
+	// OrgID resolves id's owning org — see ProjectRepository.OrgID for the
+	// usual reason (a deep-by-ID route with no orgId in its URL). The
+	// scheduler's Layer 2 quota check (phase-6-multi-tenant-saas.md Task 6)
+	// is the one caller with no RLS session at all: it runs this over its
+	// own admin/bypass connection, the same reasoning
+	// ReconcileRepository's doc comment already gives for that connection's
+	// existence.
+	OrgID(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
 }
 
 type deploymentRepository struct{ conn Conn }
@@ -147,4 +155,16 @@ func (r *deploymentRepository) Latest(ctx context.Context, applicationID uuid.UU
 		 ORDER BY revision DESC LIMIT 1`,
 		applicationID,
 	))
+}
+
+func (r *deploymentRepository) OrgID(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	var orgID uuid.UUID
+	err := r.conn.QueryRow(ctx, `SELECT org_id FROM deployments WHERE id = $1`, id).Scan(&orgID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, ErrNotFound
+		}
+		return uuid.Nil, fmt.Errorf("resolving deployment org: %w", err)
+	}
+	return orgID, nil
 }

@@ -98,7 +98,10 @@ func (s *Server) handleCreateApplication(w http.ResponseWriter, r *http.Request)
 			return err
 		}
 		app, err = db.NewApplicationRepository(conn).Create(ctx, orgID, projectID, req.Name, req.Image, ports)
-		return mapDBError(err, "", "an application with this name already exists")
+		if err != nil {
+			return mapDBError(err, "", "an application with this name already exists")
+		}
+		return recordAudit(ctx, conn, orgID, userID, "application.create", "application", app.ID, map[string]any{"name": app.Name, "image": app.Image})
 	})
 	if err != nil {
 		s.writeError(w, r, err)
@@ -112,9 +115,10 @@ type scaleApplicationRequest struct {
 }
 
 // handleScaleApplication is PATCH /v1/applications/:appId
-// (api-conventions.md §4: partial updates use PATCH), gated behind the same
-// PermApplicationDeploy permission handleDeploy uses — scaling is a form of
-// desired-state change, same trust level as deploying a new image. It only
+// (api-conventions.md §4: partial updates use PATCH), gated behind its own
+// PermApplicationScale permission (phase-6-multi-tenant-saas.md open
+// decision 1) — same allow-set as PermApplicationDeploy today, but decoupled
+// so a future role split doesn't require a handler change. It only
 // writes applications.replicas_desired; it does not place or remove any
 // container itself (phase-3-controllers.md Task 5) — the Deployment
 // controller (Task 4) picks up the new desired state on its next reconcile
@@ -146,16 +150,34 @@ func (s *Server) handleScaleApplication(w http.ResponseWriter, r *http.Request) 
 		if err := db.SetCurrentOrg(ctx, conn, orgID); err != nil {
 			return err
 		}
-		if err := requirePermission(ctx, conn, userID, orgID, auth.PermApplicationDeploy); err != nil {
+		if err := requirePermission(ctx, conn, userID, orgID, auth.PermApplicationScale); err != nil {
 			return err
 		}
 
 		apps := db.NewApplicationRepository(conn)
+		current, err := apps.Get(ctx, appID)
+		if err != nil {
+			return mapDBError(err, "no application with this id in an organization you belong to", "")
+		}
+		// Layer 1 of the three-layer quota scheme
+		// (phase-6-multi-tenant-saas.md Task 6) — see quota.go's own doc
+		// comment. Checked against current (pre-scale) state so the
+		// container-count delta is meaningful; only a net increase can ever
+		// be rejected (scaling down always shrinks or holds every total).
+		if err := checkResourceQuota(ctx, conn, orgID, current, *req.ReplicasDesired); err != nil {
+			return err
+		}
 		if err := apps.UpdateReplicas(ctx, appID, *req.ReplicasDesired); err != nil {
 			return mapDBError(err, "no application with this id in an organization you belong to", "")
 		}
 		app, err = apps.Get(ctx, appID)
-		return mapDBError(err, "no application with this id in an organization you belong to", "")
+		if err != nil {
+			return mapDBError(err, "no application with this id in an organization you belong to", "")
+		}
+		return recordAudit(ctx, conn, orgID, userID, "application.scale", "application", appID, map[string]any{
+			"replicas_desired_from": current.ReplicasDesired,
+			"replicas_desired_to":   *req.ReplicasDesired,
+		})
 	})
 	if err != nil {
 		s.writeError(w, r, err)
@@ -251,7 +273,10 @@ func (s *Server) handleDeleteApplication(w http.ResponseWriter, r *http.Request)
 		if err := requirePermission(ctx, conn, userID, orgID, auth.PermApplicationDelete); err != nil {
 			return err
 		}
-		return mapDBError(db.NewApplicationRepository(conn).Delete(ctx, appID), "no application with this id in an organization you belong to", "")
+		if err := db.NewApplicationRepository(conn).Delete(ctx, appID); err != nil {
+			return mapDBError(err, "no application with this id in an organization you belong to", "")
+		}
+		return recordAudit(ctx, conn, orgID, userID, "application.delete", "application", appID, nil)
 	})
 	if err != nil {
 		s.writeError(w, r, err)

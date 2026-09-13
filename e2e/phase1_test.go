@@ -63,7 +63,7 @@ func TestE2E_Phase1ExitCriteria(t *testing.T) {
 	goBin := goBinary(t)
 	binDir := t.TempDir()
 
-	_, dbURL := startPostgres(t, ctx)
+	adminDBURL, dbURL := startPostgres(t, ctx)
 	natsURL := startNATS(t, ctx)
 	// phase-2-multi-node.md Task 6 changed deploy from a synchronous HTTP
 	// call to the worker into an event-driven placement.requested publish —
@@ -74,7 +74,7 @@ func TestE2E_Phase1ExitCriteria(t *testing.T) {
 	// core-NATS publish with no persistence, so if the scheduler's
 	// node.*.register subscription isn't live yet when the worker starts,
 	// that registration is lost forever and the node is never placeable.
-	startScheduler(t, ctx, goBin, binDir, dbURL, natsURL)
+	startScheduler(t, ctx, goBin, binDir, adminDBURL, dbURL, natsURL)
 	workerURL := startService(t, ctx, goBin, binDir, "worker", "platform/services/worker",
 		"WORKER_LISTEN_ADDR", []string{
 			"WORKER_NATS_URL=" + natsURL,
@@ -215,10 +215,16 @@ func startNATS(t *testing.T, ctx context.Context) string {
 // process. Unlike startService, it has no HTTP surface to poll for
 // readiness — the scheduler is entirely NATS/Postgres-driven — so this just
 // starts it and lets the deploy step further down give it time to catch up.
-// extraEnv lets callers override the scheduler's own tunables (e.g. Phase
-// 2's exit-criteria test speeds up the liveness sweep so it doesn't have to
-// wait out the 15s/5s production defaults for a killed node to drop out).
-func startScheduler(t *testing.T, ctx context.Context, goBin, binDir, dbURL, natsURL string, extraEnv ...string) {
+// adminDBURL is the superuser connection scheduler's own main.go has
+// required since phase-6-multi-tenant-saas.md Task 6 (SCHEDULER_ADMIN_
+// DATABASE_URL, for the RLS-bypassing quota/deployment re-check — see that
+// file's doc comment) — without it, the scheduler falls back to its
+// hardcoded localhost:5432 default, fails to connect to the ephemeral
+// testcontainer port, and exits immediately. extraEnv lets callers override
+// the scheduler's own tunables (e.g. Phase 2's exit-criteria test speeds up
+// the liveness sweep so it doesn't have to wait out the 15s/5s production
+// defaults for a killed node to drop out).
+func startScheduler(t *testing.T, ctx context.Context, goBin, binDir, adminDBURL, dbURL, natsURL string, extraEnv ...string) {
 	t.Helper()
 
 	binPath := filepath.Join(binDir, "scheduler"+exeSuffix())
@@ -227,7 +233,10 @@ func startScheduler(t *testing.T, ctx context.Context, goBin, binDir, dbURL, nat
 	// #nosec G204 -- binPath is a binary this same test just built into
 	// t.TempDir(), not external input.
 	cmd := exec.CommandContext(ctx, binPath)
-	cmd.Env = append(append(os.Environ(), "APP_DATABASE_URL="+dbURL, "SCHEDULER_NATS_URL="+natsURL), extraEnv...)
+	cmd.Env = append(append(os.Environ(),
+		"APP_DATABASE_URL="+dbURL,
+		"SCHEDULER_ADMIN_DATABASE_URL="+adminDBURL,
+		"SCHEDULER_NATS_URL="+natsURL), extraEnv...)
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output

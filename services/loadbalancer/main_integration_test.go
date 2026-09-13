@@ -14,6 +14,7 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptotls "crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -85,7 +86,7 @@ func TestLoadBalancer_DistributesAcrossHealthyInstances(t *testing.T) {
 	startTestScheduler(t, ctx, appDSN, natsURL)
 	startTestWorker(t, ctx, natsURL)
 	startTestControllerManager(t, ctx, adminDSN, natsURL, "1s", "1s")
-	lbAddr := startTestLoadBalancer(t, ctx, appDSN, natsURL, "5s")
+	lbAddr, _ := startTestLoadBalancer(t, ctx, appDSN, adminDSN, natsURL, "5s")
 
 	containers := db.NewContainerRepository(pool.Conn())
 	services := db.NewServiceRepository(pool.Conn())
@@ -238,7 +239,7 @@ func TestLoadBalancer_EjectsDeadBackendViaActiveHealthCheck(t *testing.T) {
 	// Task 3's service.updated removal path beating it to the same outcome.
 	startTestControllerManager(t, ctx, adminDSN, natsURL, "1s", "60s")
 	const healthCheckInterval = 1 * time.Second
-	lbAddr := startTestLoadBalancer(t, ctx, appDSN, natsURL, healthCheckInterval.String())
+	lbAddr, _ := startTestLoadBalancer(t, ctx, appDSN, adminDSN, natsURL, healthCheckInterval.String())
 
 	containers := db.NewContainerRepository(pool.Conn())
 	services := db.NewServiceRepository(pool.Conn())
@@ -360,6 +361,357 @@ func TestLoadBalancer_EjectsDeadBackendViaActiveHealthCheck(t *testing.T) {
 	if survivors == 0 {
 		t.Fatalf("expected the load balancer to keep routing to the surviving backends throughout the window, last-seen times: %+v", lastSeen)
 	}
+}
+
+// TestLoadBalancer_RoutesByHostHeader is Task 4's acceptance
+// (phase-5-networking-ingress.md): two applications, one registered domain
+// each, one load balancer instance — confirm a request's Host header
+// routes it to its own application's backend (not the other's), and that
+// an unregistered Host gets 404 rather than falling through to anything.
+// Domain rows are seeded directly via admin SQL (no apiserver involved in
+// this test, same precedent as seedApplicationWithReplicas below) — this
+// test's job is the load balancer's resync + routing, not the API route
+// Task 2 already covers.
+func TestLoadBalancer_RoutesByHostHeader(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	rt, err := runtime.NewDockerRuntime()
+	if err != nil {
+		t.Skipf("docker daemon not available, skipping: %v", err)
+	}
+	defer func() { _ = rt.Close() }()
+
+	adminDSN, appDSN, adminDB, pool := startTestPostgres(t, ctx)
+	defer func() { _ = adminDB.Close() }()
+
+	appAID, appBID, depAID, depBID := seedTwoApplications(t, ctx, adminDB)
+
+	natsContainer, err := nats.Run(ctx, "nats:2.11.7")
+	if err != nil {
+		t.Fatalf("starting nats container: %v", err)
+	}
+	t.Cleanup(func() { _ = natsContainer.Terminate(context.Background()) })
+
+	natsURL, err := natsContainer.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("nats connection string: %v", err)
+	}
+
+	bus, err := eventbus.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connecting eventbus: %v", err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.PlacementStream,
+		Subjects: []string{eventbus.PlacementStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.PlacementStream, err)
+	}
+
+	startTestScheduler(t, ctx, appDSN, natsURL)
+	startTestWorker(t, ctx, natsURL)
+	startTestControllerManager(t, ctx, adminDSN, natsURL, "1s", "1s")
+	lbAddr, _ := startTestLoadBalancer(t, ctx, appDSN, adminDSN, natsURL, "5s")
+
+	containers := db.NewContainerRepository(pool.Conn())
+	services := db.NewServiceRepository(pool.Conn())
+	instances := db.NewServiceInstanceRepository(pool.Conn())
+
+	waitForHealthyServiceInstances(t, ctx, services, instances, appAID, 1, 90*time.Second)
+	waitForHealthyServiceInstances(t, ctx, services, instances, appBID, 1, 90*time.Second)
+
+	for _, depID := range []uuid.UUID{depAID, depBID} {
+		running, err := containers.ListByDeployment(ctx, depID)
+		if err != nil {
+			t.Fatalf("ListByDeployment: %v", err)
+		}
+		for _, c := range running {
+			if c.Status != db.ContainerStatusRunning || c.ContainerRuntimeID == nil {
+				continue
+			}
+			runtimeID := *c.ContainerRuntimeID
+			t.Cleanup(func() {
+				_ = rt.StopContainer(context.Background(), runtimeID, 5*time.Second)
+				_ = rt.RemoveContainer(context.Background(), runtimeID)
+			})
+		}
+	}
+
+	const hostnameA = "app-a.e2e-domains.test"
+	const hostnameB = "app-b.e2e-domains.test"
+	if _, err := adminDB.ExecContext(ctx,
+		`INSERT INTO domains (org_id, project_id, application_id, hostname) VALUES
+		 ((SELECT org_id FROM applications WHERE id = $1), (SELECT project_id FROM applications WHERE id = $1), $1, $2),
+		 ((SELECT org_id FROM applications WHERE id = $3), (SELECT project_id FROM applications WHERE id = $3), $3, $4)`,
+		appAID, hostnameA, appBID, hostnameB,
+	); err != nil {
+		t.Fatalf("seeding domains: %v", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// The load balancer's resync ticker (1s, set by startTestLoadBalancer)
+	// needs a moment to pick up the domain rows just inserted — poll rather
+	// than sleep a fixed guess.
+	var hostnameSeenA, hostnameSeenB string
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		hostnameSeenA, err = requestBackendHostnameByHost(client, lbAddr, hostnameA)
+		if err == nil {
+			hostnameSeenB, err = requestBackendHostnameByHost(client, lbAddr, hostnameB)
+		}
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the load balancer to pick up the registered domains: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if hostnameSeenA == "" || hostnameSeenB == "" || hostnameSeenA == hostnameSeenB {
+		t.Fatalf("expected Host %q and Host %q to reach two distinct backends, got %q and %q", hostnameA, hostnameB, hostnameSeenA, hostnameSeenB)
+	}
+
+	// An unregistered Host, and no X-Platform-Service header, must 404 —
+	// not silently fall through to either application.
+	req, err := http.NewRequest(http.MethodGet, "http://"+lbAddr+"/", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	req.Host = "unregistered.e2e-domains.test"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("requesting unregistered host: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unregistered host: status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// requestBackendHostnameByHost sends one request through the load balancer
+// at lbAddr with its Host header set to host (Task 4's real routing key,
+// as opposed to requestBackendHostname's ServiceHeader), and extracts
+// traefik/whoami's "Hostname: <id>" line from the response body.
+func requestBackendHostnameByHost(client *http.Client, lbAddr, host string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, "http://"+lbAddr+"/", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Host = host
+	return doRequestAndParseHostname(client, req)
+}
+
+// TestLoadBalancer_TLSTerminatesWithSelfSignedCert is Task 5's acceptance
+// (phase-5-networking-ingress.md): a TLS client dialing the HTTPS listener
+// with InsecureSkipVerify and a registered hostname's SNI reaches the right
+// backend, and the plain HTTP listener keeps routing the very same hostname
+// unchanged alongside it (open decision 4 — no forced redirect). The domain
+// row is seeded directly via admin SQL, same precedent as
+// TestLoadBalancer_RoutesByHostHeader — this test's job is the TLS
+// listener/CertProvider, not the API route Task 2 already covers.
+func TestLoadBalancer_TLSTerminatesWithSelfSignedCert(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	rt, err := runtime.NewDockerRuntime()
+	if err != nil {
+		t.Skipf("docker daemon not available, skipping: %v", err)
+	}
+	defer func() { _ = rt.Close() }()
+
+	adminDSN, appDSN, adminDB, pool := startTestPostgres(t, ctx)
+	defer func() { _ = adminDB.Close() }()
+
+	applicationID, deploymentID := seedApplicationWithReplicas(t, ctx, adminDB, 1)
+
+	natsContainer, err := nats.Run(ctx, "nats:2.11.7")
+	if err != nil {
+		t.Fatalf("starting nats container: %v", err)
+	}
+	t.Cleanup(func() { _ = natsContainer.Terminate(context.Background()) })
+
+	natsURL, err := natsContainer.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("nats connection string: %v", err)
+	}
+
+	bus, err := eventbus.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connecting eventbus: %v", err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+	if err := bus.EnsureStream(ctx, eventbus.StreamConfig{
+		Name:     eventbus.PlacementStream,
+		Subjects: []string{eventbus.PlacementStreamFilter},
+	}); err != nil {
+		t.Fatalf("ensuring %s stream: %v", eventbus.PlacementStream, err)
+	}
+
+	startTestScheduler(t, ctx, appDSN, natsURL)
+	startTestWorker(t, ctx, natsURL)
+	startTestControllerManager(t, ctx, adminDSN, natsURL, "1s", "1s")
+	httpAddr, tlsAddr := startTestLoadBalancer(t, ctx, appDSN, adminDSN, natsURL, "5s")
+
+	containers := db.NewContainerRepository(pool.Conn())
+	services := db.NewServiceRepository(pool.Conn())
+	instances := db.NewServiceInstanceRepository(pool.Conn())
+
+	waitForHealthyServiceInstances(t, ctx, services, instances, applicationID, 1, 90*time.Second)
+
+	running, err := containers.ListByDeployment(ctx, deploymentID)
+	if err != nil {
+		t.Fatalf("ListByDeployment: %v", err)
+	}
+	for _, c := range running {
+		if c.Status != db.ContainerStatusRunning || c.ContainerRuntimeID == nil {
+			continue
+		}
+		runtimeID := *c.ContainerRuntimeID
+		t.Cleanup(func() {
+			_ = rt.StopContainer(context.Background(), runtimeID, 5*time.Second)
+			_ = rt.RemoveContainer(context.Background(), runtimeID)
+		})
+	}
+
+	const hostname = "app.e2e-tls.test"
+	if _, err := adminDB.ExecContext(ctx,
+		`INSERT INTO domains (org_id, project_id, application_id, hostname)
+		 SELECT org_id, project_id, id, $2 FROM applications WHERE id = $1`,
+		applicationID, hostname,
+	); err != nil {
+		t.Fatalf("seeding domain: %v", err)
+	}
+
+	tlsClient := newSNIClient(tlsAddr)
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+
+	// The resync ticker (1s, set by startTestLoadBalancer) needs a moment to
+	// pick up the domain row just inserted — poll rather than sleep a fixed
+	// guess.
+	var tlsHostname string
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		tlsHostname, err = requestBackendHostnameTLS(tlsClient, hostname)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the tls listener to route %q: %v", hostname, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if tlsHostname == "" {
+		t.Fatalf("expected a non-empty backend hostname via tls")
+	}
+
+	// Open decision 4: plain HTTP keeps routing the same hostname
+	// unchanged alongside TLS, no forced redirect.
+	httpHostname, err := requestBackendHostnameByHost(httpClient, httpAddr, hostname)
+	if err != nil {
+		t.Fatalf("requesting via plain http after tls succeeded: %v", err)
+	}
+	if httpHostname != tlsHostname {
+		t.Fatalf("expected http and https to reach the same backend for %q, got http=%q tls=%q", hostname, httpHostname, tlsHostname)
+	}
+}
+
+// newSNIClient builds an http.Client whose https requests always dial
+// tlsAddr directly (the load balancer's real TLS listener in this test,
+// bypassing DNS entirely) while still sending the request URL's own
+// hostname as the TLS ClientHello's SNI — exactly what a real client
+// reaches a self-signed-cert-fronted domain with. InsecureSkipVerify is the
+// only honest way to test a self-signed cert (Task 5's own acceptance
+// wording, phase-5-networking-ingress.md).
+func newSNIClient(tlsAddr string) *http.Client {
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				serverName := addr
+				if h, _, err := net.SplitHostPort(addr); err == nil {
+					serverName = h
+				}
+				rawConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", tlsAddr)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := cryptotls.Client(rawConn, &cryptotls.Config{
+					ServerName:         serverName,
+					InsecureSkipVerify: true,
+				})
+				if err := tlsConn.HandshakeContext(ctx); err != nil {
+					_ = rawConn.Close()
+					return nil, err
+				}
+				return tlsConn, nil
+			},
+		},
+	}
+}
+
+// requestBackendHostnameTLS sends one HTTPS request through client (built
+// by newSNIClient) to hostname, and extracts traefik/whoami's own
+// "Hostname: <id>" line from the response body.
+func requestBackendHostnameTLS(client *http.Client, hostname string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, "https://"+hostname+"/", nil)
+	if err != nil {
+		return "", err
+	}
+	return doRequestAndParseHostname(client, req)
+}
+
+// seedTwoApplications inserts one organization/user/project and two
+// applications (traefik/whoami, 1 replica each) with one deployment each —
+// Task 4's own two-tenant-application scenario, distinct from
+// seedApplicationWithReplicas' single-application/N-replica one. A single
+// shared org/project is deliberate (avoids seedApplicationWithReplicas'
+// hardcoded organization slug colliding if called twice) and realistic
+// (one tenant can register domains for more than one of their own
+// applications).
+func seedTwoApplications(t *testing.T, ctx context.Context, adminDB *sql.DB) (appAID, appBID, depAID, depBID uuid.UUID) {
+	t.Helper()
+
+	var orgID, userID, projectID uuid.UUID
+	if err := adminDB.QueryRowContext(ctx,
+		`INSERT INTO organizations (name, slug) VALUES ('Org', 'org') RETURNING id`,
+	).Scan(&orgID); err != nil {
+		t.Fatalf("seeding organization: %v", err)
+	}
+	if err := adminDB.QueryRowContext(ctx,
+		`INSERT INTO users (email, password_hash) VALUES ('user@example.com', 'hash') RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatalf("seeding user: %v", err)
+	}
+	if err := adminDB.QueryRowContext(ctx,
+		`INSERT INTO projects (org_id, name, slug) VALUES ($1, 'Project', 'project') RETURNING id`, orgID,
+	).Scan(&projectID); err != nil {
+		t.Fatalf("seeding project: %v", err)
+	}
+
+	seedOne := func(name, slug string) (applicationID, deploymentID uuid.UUID) {
+		if err := adminDB.QueryRowContext(ctx,
+			`INSERT INTO applications (org_id, project_id, name, image, replicas_desired, ports)
+			 VALUES ($1, $2, $3, 'traefik/whoami', 1, '[{"container_port": 80}]'::jsonb) RETURNING id`,
+			orgID, projectID, name,
+		).Scan(&applicationID); err != nil {
+			t.Fatalf("seeding application %q: %v", name, err)
+		}
+		if err := adminDB.QueryRowContext(ctx,
+			`INSERT INTO deployments (org_id, application_id, image, revision, created_by) VALUES ($1, $2, 'traefik/whoami', 1, $3) RETURNING id`,
+			orgID, applicationID, userID,
+		).Scan(&deploymentID); err != nil {
+			t.Fatalf("seeding deployment for %q: %v", name, err)
+		}
+		return applicationID, deploymentID
+	}
+
+	appAID, depAID = seedOne("app-a", "app-a")
+	appBID, depBID = seedOne("app-b", "app-b")
+	return appAID, appBID, depAID, depBID
 }
 
 // seedApplicationWithReplicas inserts one organization/user/project/
@@ -647,10 +999,15 @@ func startTestControllerManager(t *testing.T, ctx context.Context, adminDSN, nat
 // startTestLoadBalancer builds and runs the real loadbalancer binary under
 // test as a separate OS process (ADR-0012), pointed at dbURL/natsURL, with
 // a fast resync interval and a reserved free port to actually send HTTP
-// requests against. healthCheckInterval is exposed explicitly so Task 5's
-// test can set it fast (its own acceptance criterion is "within one
-// health-check interval"). Returns the address it's listening on.
-func startTestLoadBalancer(t *testing.T, ctx context.Context, dbURL, natsURL, healthCheckInterval string) string {
+// requests against. adminDBURL backs the Task 4 (phase-5-networking-
+// ingress.md) DomainRoutingRepository connection — without it the process
+// falls back to LOADBALANCER_ADMIN_DATABASE_URL's own production default
+// and fails to start against this test's actual (randomly-ported)
+// container. healthCheckInterval is exposed explicitly so Task 5's test
+// can set it fast (its own acceptance criterion is "within one
+// health-check interval"). Returns the plain-HTTP and TLS addresses it's
+// listening on (Task 5, phase-5-networking-ingress.md).
+func startTestLoadBalancer(t *testing.T, ctx context.Context, dbURL, adminDBURL, natsURL, healthCheckInterval string) (httpAddr, tlsAddr string) {
 	t.Helper()
 
 	goBin, err := goBinary()
@@ -667,15 +1024,18 @@ func startTestLoadBalancer(t *testing.T, ctx context.Context, dbURL, natsURL, he
 		t.Fatalf("building loadbalancer binary: %v\n%s", err, out)
 	}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", freeTCPPort(t))
+	httpAddr = fmt.Sprintf("127.0.0.1:%d", freeTCPPort(t))
+	tlsAddr = fmt.Sprintf("127.0.0.1:%d", freeTCPPort(t))
 
 	// #nosec G204 -- binPath is the binary this same test just built into
 	// t.TempDir(), not external input.
 	cmd := exec.CommandContext(ctx, binPath)
 	cmd.Env = append(os.Environ(),
 		"APP_DATABASE_URL="+dbURL,
+		"LOADBALANCER_ADMIN_DATABASE_URL="+adminDBURL,
 		"LOADBALANCER_NATS_URL="+natsURL,
-		"LOADBALANCER_LISTEN_ADDR="+addr,
+		"LOADBALANCER_LISTEN_ADDR="+httpAddr,
+		"LOADBALANCER_TLS_LISTEN_ADDR="+tlsAddr,
 		"LOADBALANCER_RESYNC_INTERVAL=1s",
 		"LOADBALANCER_HEALTH_CHECK_INTERVAL="+healthCheckInterval,
 	)
@@ -692,7 +1052,7 @@ func startTestLoadBalancer(t *testing.T, ctx context.Context, dbURL, natsURL, he
 			t.Logf("loadbalancer process output:\n%s", output.String())
 		}
 	})
-	return addr
+	return httpAddr, tlsAddr
 }
 
 // freeTCPPort reserves an OS-assigned free TCP port and immediately

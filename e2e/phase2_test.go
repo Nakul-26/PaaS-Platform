@@ -51,14 +51,14 @@ func TestE2E_Phase2ExitCriteria(t *testing.T) {
 	containersBefore := dockerContainerIDs(t, "nginx:latest")
 	t.Cleanup(func() { removeNewContainers(t, "nginx:latest", containersBefore) })
 
-	_, dbURL := startPostgres(t, ctx)
+	adminDBURL, dbURL := startPostgres(t, ctx)
 	natsURL := startNATS(t, ctx)
 
 	// Speed up the liveness sweep the final assertion waits on — Task 5's
 	// production defaults (15s heartbeat timeout / 5s sweep interval) would
 	// still pass, just slowly; both are configurable precisely so a test
 	// like this one isn't stuck paying that cost.
-	startScheduler(t, ctx, goBin, binDir, dbURL, natsURL,
+	startScheduler(t, ctx, goBin, binDir, adminDBURL, dbURL, natsURL,
 		"SCHEDULER_HEARTBEAT_TIMEOUT=3s", "SCHEDULER_LIVENESS_SWEEP_INTERVAL=1s")
 
 	workerBinPath := filepath.Join(binDir, "worker"+exeSuffix())

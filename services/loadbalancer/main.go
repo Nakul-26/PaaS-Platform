@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	cryptotls "crypto/tls"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -26,6 +27,7 @@ import (
 	"platform/services/loadbalancer/internal/proxy"
 	"platform/services/loadbalancer/internal/registry"
 	"platform/services/loadbalancer/internal/strategy"
+	lbtls "platform/services/loadbalancer/internal/tls"
 )
 
 func main() {
@@ -47,6 +49,22 @@ func main() {
 	defer pool.Close()
 	lbRepo := db.NewLoadBalancerRepository(pool.Conn())
 
+	// domains carries RLS (it's tenant-authored config, unlike
+	// services/service_instances above) — the resync below needs every
+	// tenant's domains with no per-request session to scope RLS off of, so
+	// this connects as a second, narrowly-scoped superuser role rather than
+	// widening platform_app's own privileges (phase-5-networking-ingress.md
+	// Task 1/4 open decision 1, internal/db.DomainRoutingRepository's own
+	// doc comment, mirroring controller-manager's DATABASE_URL exactly).
+	adminDBURL := config.String("LOADBALANCER_ADMIN_DATABASE_URL", "postgres://platform:platform@localhost:5432/platform?sslmode=disable")
+	adminPool, err := db.Open(ctx, adminDBURL)
+	if err != nil {
+		logger.Error("connecting to postgres as admin", "error", err)
+		os.Exit(1)
+	}
+	defer adminPool.Close()
+	domainRepo := db.NewDomainRoutingRepository(adminPool.Conn())
+
 	bus := connectEventBus(ctx, logger)
 	if bus == nil {
 		logger.Error("loadbalancer: giving up connecting to nats, cannot function without it")
@@ -58,7 +76,7 @@ func main() {
 
 	// Synchronous first resync so the registry isn't empty for whatever
 	// request arrives the instant this process starts serving.
-	resync(ctx, lbRepo, reg, logger)
+	resync(ctx, lbRepo, domainRepo, reg, logger)
 
 	sub, err := bus.Subscribe(eventbus.ServiceUpdatedSubject, func(msg eventbus.Message) {
 		handleServiceUpdated(ctx, lbRepo, reg, logger, msg.Data)
@@ -78,7 +96,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				resync(ctx, lbRepo, reg, logger)
+				resync(ctx, lbRepo, domainRepo, reg, logger)
 			}
 		}
 	}()
@@ -116,10 +134,16 @@ func main() {
 	// reconsidered, independent of the active checker's own interval.
 	ejectionWindow := config.Duration("LOADBALANCER_EJECTION_WINDOW", 10*time.Second)
 
+	// Same Handler instance serves both listeners below — it's already safe
+	// for concurrent use (registry.Registry's own doc comment) since every
+	// request-handling goroutine only ever reads it via the registry's
+	// RWMutex, TLS or not.
+	handler := proxy.New(reg, ejectionWindow, logger)
+
 	addr := config.String("LOADBALANCER_LISTEN_ADDR", ":8090")
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           proxy.New(reg, ejectionWindow, logger),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -127,6 +151,36 @@ func main() {
 		logger.Info("loadbalancer: listening", "addr", addr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("loadbalancer: http server error", "error", err)
+		}
+	}()
+
+	// Task 5's TLS listener (ARCHITECTURE.md §2.5): plain HTTP above keeps
+	// working unchanged alongside this, no forced redirect (open decision
+	// 4) — a tenant's domain can be reached either way indefinitely.
+	// GetCertificate resolves SNI through CertProvider only, never
+	// Postgres, on every handshake (§2.5/§2.6's hot-path rule).
+	certProvider := lbtls.NewSelfSigned()
+	tlsAddr := config.String("LOADBALANCER_TLS_LISTEN_ADDR", ":8443")
+	tlsServer := &http.Server{
+		Addr:              tlsAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		TLSConfig: &cryptotls.Config{
+			GetCertificate: func(hello *cryptotls.ClientHelloInfo) (*cryptotls.Certificate, error) {
+				if hello.ServerName == "" {
+					return nil, errors.New("loadbalancer: tls handshake with no SNI hostname")
+				}
+				return certProvider.GetCertificate(hello.ServerName)
+			},
+		},
+	}
+
+	go func() {
+		logger.Info("loadbalancer: listening (tls)", "addr", tlsAddr)
+		// cert/key file args are empty because TLSConfig.GetCertificate
+		// supplies certificates per-handshake — nothing to load from disk.
+		if err := tlsServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("loadbalancer: https server error", "error", err)
 		}
 	}()
 
@@ -138,27 +192,47 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("loadbalancer: graceful shutdown failed", "error", err)
 	}
+	if err := tlsServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("loadbalancer: graceful tls shutdown failed", "error", err)
+	}
 }
 
 // resync rebuilds the registry from scratch from Postgres — the periodic
-// fallback (§2.6) for a missed service.updated event. A query failure
-// leaves the previous registry contents in place (stale-but-serving beats
-// empty-and-refusing-everything) rather than clearing the registry.
-func resync(ctx context.Context, repo db.LoadBalancerRepository, reg *registry.Registry, logger *slog.Logger) {
+// fallback (§2.6) for a missed service.updated event, plus (Task 4,
+// phase-5-networking-ingress.md) the hostname -> dns_name routing table,
+// reusing this same ticker rather than a separate one (open decision 2: no
+// push event for domain changes, so this periodic pull is domain routing's
+// only refresh path, not just a fallback for it). The two queries run
+// independently and fail independently — a failure in one leaves its half
+// of the registry's previous contents in place (stale-but-serving beats
+// empty-and-refusing-everything) without blocking the other half from
+// refreshing normally.
+func resync(ctx context.Context, repo db.LoadBalancerRepository, domainRepo db.DomainRoutingRepository, reg *registry.Registry, logger *slog.Logger) {
 	entries, err := repo.ListHealthyRegistry(ctx)
 	if err != nil {
-		logger.Error("loadbalancer: resync failed, keeping previous registry contents", "error", err)
+		logger.Error("loadbalancer: service resync failed, keeping previous registry contents", "error", err)
+	} else {
+		byDNS := make(map[string][]registry.Instance)
+		for _, e := range entries {
+			byDNS[e.DNSName] = append(byDNS[e.DNSName], registry.Instance{
+				ContainerID: e.ContainerID,
+				IP:          e.IP,
+				Port:        e.Port,
+			})
+		}
+		reg.ReplaceAll(byDNS)
+	}
+
+	routes, err := domainRepo.ListRoutes(ctx)
+	if err != nil {
+		logger.Error("loadbalancer: domain resync failed, keeping previous host routes", "error", err)
 		return
 	}
-	byDNS := make(map[string][]registry.Instance)
-	for _, e := range entries {
-		byDNS[e.DNSName] = append(byDNS[e.DNSName], registry.Instance{
-			ContainerID: e.ContainerID,
-			IP:          e.IP,
-			Port:        e.Port,
-		})
+	hostRoutes := make(map[string]string, len(routes))
+	for _, rt := range routes {
+		hostRoutes[rt.Hostname] = rt.DNSName
 	}
-	reg.ReplaceAll(byDNS)
+	reg.ReplaceHostRoutes(hostRoutes)
 }
 
 // updatedMessage is service.updated's payload (docs/nats-contract.md,
